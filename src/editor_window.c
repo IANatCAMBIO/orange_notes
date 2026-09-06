@@ -2422,6 +2422,81 @@ action_due_ord(GtkTextBuffer *buffer, gint ord, gint64 due)
 }
 
 /* ---------------------------------------------------------------------------
+ * action_text_ord() — replace the TEXT of the `ord`-th REAL action line,
+ * leaving the '!' prefix, the line's own whitespace around the text and
+ * any trailing "due <date>" exactly as they were.  The span replaced is
+ * the one on_action_split_due marks off — the SAME derivation the
+ * extractor uses to produce OnActionItem.text — so the rewritten line
+ * re-extracts to `text` and no due date is needed for the boundary
+ * (without one the item text simply runs to the end of the line).
+ * The replacement is given the old text's strike state explicitly, so
+ * renaming a done item neither reopens it nor silently completes it.
+ *   text — the new item text; the caller guarantees it is non-blank and
+ *          newline-free (a blank would stop the line being an item at
+ *          all, a newline would split it into two).
+ * Returns TRUE when the line was found.
+ * ------------------------------------------------------------------------- */
+static gboolean
+action_text_ord(GtkTextBuffer *buffer, gint ord, const gchar *text)
+{
+    GtkTextIter ls, rs, le;          /* line span (+ rest start)            */
+    if (!action_nth_real_line(buffer, ord, &ls, &rs, &le))
+        return FALSE;
+    gchar *rest = gtk_text_buffer_get_text(buffer, &rs, &le, FALSE);
+
+    /* Byte span of the item text inside `rest`: up to an existing
+     * "due <date>" (or the whole rest), then trailing whitespace dropped
+     * and leading whitespace skipped, so the line keeps its own spacing.  */
+    gsize  text_bytes;               /* end of the item text                */
+    gsize  due_start;
+    gint64 due;
+    text_bytes = on_action_split_due(rest, &due_start, &due)
+                 ? due_start : strlen(rest);
+    while (text_bytes > 0 &&
+           g_ascii_isspace((guchar)rest[text_bytes - 1]))
+        text_bytes--;
+    gsize lead = 0;                  /* whitespace right after the '!'      */
+    while (lead < text_bytes && g_ascii_isspace((guchar)rest[lead]))
+        lead++;
+
+    GtkTextIter start = rs;          /* first char of the item text         */
+    gtk_text_iter_forward_chars(&start,
+                                (gint)g_utf8_strlen(rest, (gssize)lead));
+    GtkTextIter end = rs;            /* just past the item text             */
+    gtk_text_iter_forward_chars(&end,
+                                (gint)g_utf8_strlen(rest,
+                                                    (gssize)text_bytes));
+
+    /* Struck at its last character = the done state to carry over, the
+     * same probe action_due_ord makes for the suffix it appends.          */
+    gboolean struck = FALSE;
+    if (!gtk_text_iter_equal(&start, &end)) {
+        GtkTextIter probe = end;
+        gtk_text_iter_backward_char(&probe);
+        struck = (on_flags_at_iter(buffer, &probe, ON_FMT_INLINE_MASK) &
+                  ON_FMT_STRIKE) != 0;
+    }
+    g_free(rest);
+
+    gtk_text_buffer_delete(buffer, &start, &end);
+    gint off = gtk_text_iter_get_offset(&start);   /* insertion point       */
+    gtk_text_buffer_insert(buffer, &start, text, -1);
+
+    /* `start` now sits at the END of the inserted run.  The strike is set
+     * both ways on purpose: a plain insert inherits the tags of whatever
+     * character precedes it, which on a done item is struck text.         */
+    GtkTextIter from;                /* start of the inserted run           */
+    gtk_text_buffer_get_iter_at_offset(buffer, &from, off);
+    if (struck)
+        gtk_text_buffer_apply_tag_by_name(buffer, ON_TAGNAME_STRIKE,
+                                          &from, &start);
+    else
+        gtk_text_buffer_remove_tag_by_name(buffer, ON_TAGNAME_STRIKE,
+                                           &from, &start);
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------------------
  * action_lists_equal() — same items, same order, same done flags, same
  * due dates?  Every OnActionItem field the table mirrors must be
  * compared here, or edits to that field never reach the library.
@@ -2445,13 +2520,18 @@ action_lists_equal(GList *a, GList *b)
  * on an offscreen load with an immediate save + action_items resync
  * (images keep their cached PNG bytes, so nothing is re-encoded).
  *   edit — the line edit; receives (buffer, ord, arg).
+ *   arg  — passed to `edit` untouched.  It is a pointer rather than a
+ *          value because the edits need a gboolean, a gint64 and a
+ *          string between them; each adapter below casts it back.  It is
+ *          only ever borrowed for the duration of the call.
  * Returns TRUE when the item was found and updated.
  * ------------------------------------------------------------------------- */
-typedef gboolean (*ActionEdit)(GtkTextBuffer *buffer, gint ord, gint64 arg);
+typedef gboolean (*ActionEdit)(GtkTextBuffer *buffer, gint ord,
+                               gconstpointer arg);
 
 static gboolean
 action_apply_to_note(OnApp *app, gint64 note_id, ActionEdit edit,
-                     gint ord, gint64 arg, gboolean *synced)
+                     gint ord, gconstpointer arg, gboolean *synced)
 {
     if (synced != NULL)
         *synced = FALSE;
@@ -2498,9 +2578,23 @@ action_apply_to_note(OnApp *app, gint64 note_id, ActionEdit edit,
 
 /* action_strike_edit() — ActionEdit adapter for action_strike_ord.          */
 static gboolean
-action_strike_edit(GtkTextBuffer *buffer, gint ord, gint64 arg)
+action_strike_edit(GtkTextBuffer *buffer, gint ord, gconstpointer arg)
 {
-    return action_strike_ord(buffer, ord, arg != 0);
+    return action_strike_ord(buffer, ord, *(const gboolean *)arg);
+}
+
+/* action_due_edit() — ActionEdit adapter for action_due_ord.                */
+static gboolean
+action_due_edit(GtkTextBuffer *buffer, gint ord, gconstpointer arg)
+{
+    return action_due_ord(buffer, ord, *(const gint64 *)arg);
+}
+
+/* action_text_edit() — ActionEdit adapter for action_text_ord.              */
+static gboolean
+action_text_edit(GtkTextBuffer *buffer, gint ord, gconstpointer arg)
+{
+    return action_text_ord(buffer, ord, arg);
 }
 
 gboolean
@@ -2508,13 +2602,21 @@ on_editor_action_set_done(OnApp *app, gint64 note_id, gint ord,
                           gboolean done, gboolean *synced)
 {
     return action_apply_to_note(app, note_id, action_strike_edit,
-                                ord, done ? 1 : 0, synced);
+                                ord, &done, synced);
 }
 
 gboolean
 on_editor_action_set_due(OnApp *app, gint64 note_id, gint ord, gint64 due)
 {
-    return action_apply_to_note(app, note_id, action_due_ord, ord, due,
+    return action_apply_to_note(app, note_id, action_due_edit, ord, &due,
+                                NULL);
+}
+
+gboolean
+on_editor_action_set_text(OnApp *app, gint64 note_id, gint ord,
+                          const gchar *text)
+{
+    return action_apply_to_note(app, note_id, action_text_edit, ord, text,
                                 NULL);
 }
 

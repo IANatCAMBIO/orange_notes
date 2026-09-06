@@ -140,4 +140,25 @@ gboolean on_editor_action_set_done(OnApp *app, gint64 note_id, gint ord,
 gboolean on_editor_action_set_due(OnApp *app, gint64 note_id, gint ord,
                                   gint64 due);
 
+/* ---------------------------------------------------------------------------
+ * on_editor_action_set_text() — rewrite an action item's TEXT in its note
+ * CONTENT: the '!' line keeps its prefix, its spacing and any trailing
+ * "due <date>"; only the text between them is replaced, and it carries
+ * the item's strike state over so a done item stays done.  Live-buffer +
+ * autosave when the note is open, offscreen rewrite otherwise — same
+ * contract as on_editor_action_set_done.
+ *
+ * The item's stable uid SURVIVES this: the editor's identity mark sits at
+ * the line START, outside the replaced span, so it is not pruned and the
+ * hint pass in on_db_note_set_actions re-matches the item; headless, the
+ * ord pass does the same, since a rename moves no line.
+ *   text — the new item text.  Must be non-blank and contain no newline:
+ *          a blank would stop the line being an action item and a newline
+ *          would split it into two, either of which retires the uid.
+ *          Callers validate (see cmd_action_text in cli.c).
+ * Returns TRUE when the item was found and updated.
+ * ------------------------------------------------------------------------- */
+gboolean on_editor_action_set_text(OnApp *app, gint64 note_id, gint ord,
+                                   const gchar *text);
+
 #endif /* BLUE_EDITOR_WINDOW_H */

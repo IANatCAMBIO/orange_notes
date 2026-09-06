@@ -960,15 +960,39 @@ action_token_parse(OnDatabase *db, const gchar *token,
 }
 
 /* ---------------------------------------------------------------------------
- * cmd_action_list() — every action item across the visible notes, newest
- * note first: "NOTEID:ORD<TAB>[x]/[ ]<TAB>due-date<TAB>text" ('-' = no
- * due date).  `filter` narrows to open or done items.
- *
- * with_uid prepends the item's STABLE uid as a further first column:
+ * action_print_line() — write one action item as the CLI's tab-separated
+ * record, THE one definition of that layout (shared by `action list` and
+ * `action show`, so a consumer needs a single parser):
+ *   "NOTEID:ORD<TAB>[x]/[ ]<TAB>due-date<TAB>text"   ('-' = no due date)
+ * with_uid prepends the item's STABLE uid as a further FIRST column:
  *   "UID<TAB>NOTEID:ORD<TAB>[x]/[ ]<TAB>due-date<TAB>text"
- * The default form is byte-for-byte unchanged — external consumers split
- * it into a fixed number of fields, and the text (which may itself
- * contain tabs) has to stay last, so a new column can only go in front.
+ * The text (which may itself contain tabs) has to stay last, so any new
+ * column can only go in front of the existing ones.
+ * ------------------------------------------------------------------------- */
+static void
+action_print_line(const OnActionItem *it, gboolean with_uid)
+{
+    gchar *when = NULL;              /* ISO due date, or NULL               */
+    if (it->due != 0) {
+        GDateTime *dt = g_date_time_new_from_unix_local(it->due);
+        when = g_date_time_format(dt, "%Y-%m-%d");
+        g_date_time_unref(dt);
+    }
+    if (with_uid)
+        printf("%" G_GINT64_FORMAT "\t", it->uid);
+    printf("%" G_GINT64_FORMAT ":%d\t%s\t%s\t%s\n",
+           it->note_id, it->ord,
+           it->done ? "[x]" : "[ ]",
+           when != NULL ? when : "-",
+           it->text);
+    g_free(when);
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_action_list() — every action item across the visible notes, newest
+ * note first, one action_print_line() record each.  `filter` narrows to
+ * open or done items; with_uid adds the uid column.  The default form is
+ * byte-for-byte what it always was.
  * ------------------------------------------------------------------------- */
 typedef enum { ACTION_ALL, ACTION_OPEN, ACTION_DONE } ActionFilter;
 
@@ -981,23 +1005,47 @@ cmd_action_list(OnDatabase *db, ActionFilter filter, gboolean with_uid)
         if ((filter == ACTION_OPEN && it->done) ||
             (filter == ACTION_DONE && !it->done))
             continue;
-        gchar *when = NULL;          /* ISO due date, or NULL               */
-        if (it->due != 0) {
-            GDateTime *dt = g_date_time_new_from_unix_local(it->due);
-            when = g_date_time_format(dt, "%Y-%m-%d");
-            g_date_time_unref(dt);
-        }
-        if (with_uid)
-            printf("%" G_GINT64_FORMAT "\t", it->uid);
-        printf("%" G_GINT64_FORMAT ":%d\t%s\t%s\t%s\n",
-               it->note_id, it->ord,
-               it->done ? "[x]" : "[ ]",
-               when != NULL ? when : "-",
-               it->text);
-        g_free(when);
+        action_print_line(it, with_uid);
     }
     on_db_action_list_free(items);
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_action_show() — print ONE item, addressed by stable uid (or by the
+ * positional NOTEID:ORD), as the same record `action list --uid` emits.
+ * The point is the O(1) read-back a mirror needs after writing: fetching
+ * one pinned item's current text, done state and due date without
+ * listing (and diffing) the whole table.
+ * The uid column is always present — a caller that asked for one item by
+ * uid has no reason to be denied it, and `action list` keeps the shorter
+ * default form for the bulk case.
+ * Returns 0, or 2 when no item carries that id.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_action_show(OnDatabase *db, const gchar *token)
+{
+    gint64 note_id;                  /* the item's address                  */
+    gint   ord;
+    if (!action_token_parse(db, token, &note_id, &ord))
+        return 2;
+
+    /* One query for the owning note, then the ord-th row — the same list
+     * the mirror itself is built from, so nothing new can drift.          */
+    GList *items = on_db_action_list_for_note(db, note_id);
+    int    rc = 2;                   /* process exit code                   */
+    for (GList *l = items; l != NULL; l = l->next) {
+        OnActionItem *it = l->data;  /* candidate row                       */
+        if (it->ord != ord)
+            continue;
+        action_print_line(it, TRUE);
+        rc = 0;
+        break;
+    }
+    if (rc != 0)
+        fprintf(stderr, "error: no such action item: %s\n", token);
+    on_db_action_list_free(items);
+    return rc;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1066,6 +1114,59 @@ cmd_action_due(OnDatabase *db, const gchar *token, const gchar *date_arg)
         printf("set due date of action item %s\t%s\n", token, date_arg);
     else
         printf("cleared due date of action item %s\n", token);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_action_text() — rename one item: the text of its '!' line is
+ * replaced, keeping the line's '!' prefix, its spacing and any trailing
+ * "due <date>", and carrying the done state over.  For an external mirror
+ * renaming an item it pinned by uid — that uid survives the rewrite (see
+ * on_editor_action_set_text).
+ *   content — the new text, or "-" to read it from stdin.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_action_text(OnDatabase *db, const gchar *token, const gchar *content)
+{
+    gchar *text = cli_read_content(content);   /* the new text (owned)      */
+    if (text == NULL)
+        return 2;
+
+    /* Two shapes would destroy the item rather than rename it, taking its
+     * uid with them: a blank text stops the line being an action item at
+     * all, and an embedded newline splits it into two lines.              */
+    g_strstrip(text);
+    if (*text == '\0') {
+        fprintf(stderr, "error: action item text is empty (an item needs "
+                        "text; use 'action done' to complete it, or edit "
+                        "the note to remove the line)\n");
+        g_free(text);
+        return 2;
+    }
+    if (strpbrk(text, "\n\r") != NULL) {
+        fprintf(stderr, "error: action item text contains a line break "
+                        "(one item is one line)\n");
+        g_free(text);
+        return 2;
+    }
+
+    gint64 note_id;                  /* the item's address                  */
+    gint   ord;
+    if (!action_token_parse(db, token, &note_id, &ord) ||
+        !cli_require_gtk()) {
+        g_free(text);
+        return 2;
+    }
+
+    OnApp app = { 0 };               /* headless context: db only           */
+    app.db = db;
+    if (!on_editor_action_set_text(&app, note_id, ord, text)) {
+        fprintf(stderr, "error: no such action item: %s\n", token);
+        g_free(text);
+        return 2;
+    }
+    printf("renamed action item %s\t%s\n", token, text);
+    g_free(text);
     return 0;
 }
 
@@ -1212,12 +1313,19 @@ usage(FILE *out)
 "                                    a first column: that id survives\n"
 "                                    editing, reordering and renumbering,\n"
 "                                    while NOTEID:ORD does not\n"
+"  action show UID|NOTEID:ORD        print one item as a single UID-first\n"
+"                                    'action list --uid' record (read one\n"
+"                                    pinned item back without listing all)\n"
 "  action done UID|NOTEID:ORD        mark an item done (strikes its line\n"
 "                                    in the note text)\n"
 "  action undone UID|NOTEID:ORD      reopen a completed item\n"
 "  action due UID|NOTEID:ORD DATE|-  set the item's due date (written\n"
 "                                    into the note line as 'due DATE';\n"
 "                                    '-' clears it)\n"
+"  action text UID|NOTEID:ORD TEXT|- rename an item: its '!' line's text\n"
+"                                    is replaced, keeping the done state\n"
+"                                    and any 'due DATE'; the UID survives\n"
+"                                    ('-' reads the text from stdin)\n"
 "\n"
 "  search TEXT [--regex]             case-insensitive search of all note\n"
 "                                    titles + text; prints one\n"
@@ -1291,12 +1399,16 @@ dispatch_action(OnDatabase *db, const char *verb, char **argv, int argc)
         }
         return cmd_action_list(db, filter, with_uid);
     }
+    if (g_strcmp0(verb, "show") == 0 && argc == 1)
+        return cmd_action_show(db, argv[0]);
     if (g_strcmp0(verb, "done") == 0 && argc == 1)
         return cmd_action_done(db, argv[0], TRUE);
     if (g_strcmp0(verb, "undone") == 0 && argc == 1)
         return cmd_action_done(db, argv[0], FALSE);
     if (g_strcmp0(verb, "due") == 0 && argc == 2)
         return cmd_action_due(db, argv[0], argv[1]);
+    if (g_strcmp0(verb, "text") == 0 && argc == 2)
+        return cmd_action_text(db, argv[0], argv[1]);
     return usage(stderr);
 }
 
@@ -1390,12 +1502,15 @@ cli_gui_command(const gchar *remote_cmd, void (*set_pending)(void),
 gboolean
 on_cli_command_reads_stdin(int argc, char **argv)
 {
-    /* "note new … -", "note append ID -", "note set ID -": a content
-     * argument of "-" consumes stdin.                                       */
-    if (argc < 4 || g_strcmp0(argv[1], "note") != 0 ||
-        g_strcmp0(argv[argc - 1], "-") != 0)
+    /* "note new … -", "note append ID -", "note set ID -" and
+     * "action text ID -": a content argument of "-" consumes stdin.        */
+    if (argc < 4 || g_strcmp0(argv[argc - 1], "-") != 0)
         return FALSE;
     const char *verb = argv[2];
+    if (g_strcmp0(argv[1], "action") == 0)
+        return g_strcmp0(verb, "text") == 0;
+    if (g_strcmp0(argv[1], "note") != 0)
+        return FALSE;
     return g_strcmp0(verb, "new") == 0 ||
            g_strcmp0(verb, "append") == 0 ||
            g_strcmp0(verb, "set") == 0;
@@ -1415,7 +1530,8 @@ on_cli_command_mutates(int argc, char **argv)
     if (g_strcmp0(cmd, "action") == 0)
         return g_strcmp0(verb, "done") == 0 ||
                g_strcmp0(verb, "undone") == 0 ||
-               g_strcmp0(verb, "due") == 0;
+               g_strcmp0(verb, "due") == 0 ||
+               g_strcmp0(verb, "text") == 0;   /* "show" is read-only       */
     if (g_strcmp0(cmd, "note") == 0)
         return g_strcmp0(verb, "new") == 0 ||
                g_strcmp0(verb, "append") == 0 ||

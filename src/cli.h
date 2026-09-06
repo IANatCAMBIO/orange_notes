@@ -30,8 +30,14 @@
  *                                        positions, --uid prepends the
  *                                        stable per-item id that survives
  *                                        edits and renumbering)
+ *   notes action show UID|NOTEID:ORD (one item, as an 'action list --uid'
+ *                                        record: the read-back an external
+ *                                        mirror needs for a pinned item)
  *   notes action done|undone UID|NOTEID:ORD
  *   notes action due UID|NOTEID:ORD DATE|-  (rewrites the note line)
+ *   notes action text UID|NOTEID:ORD TEXT|- (renames the item in the note
+ *                                        line, keeping its done state, its
+ *                                        due date and its UID)
  *   notes search TEXT [--regex]      (titles + full text, all notes)
  *   notes quicknote                  (new root note in the running GUI)
  *   notes backup FILE.db
