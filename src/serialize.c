@@ -337,6 +337,33 @@ on_buffer_walk(GtkTextBuffer *buffer, OnBufferSegFn cb, gpointer data)
     g_string_free(run, TRUE);
 }
 
+GBytes *
+on_image_png_bytes(GdkPixbuf *pixbuf)
+{
+    /* The pixbuf never changes once attached, so one encoding serves every
+     * writer: the cache is attached by the full-resolution load (the note's
+     * ORIGINAL bytes, so nothing is ever recompressed) or filled here on the
+     * first write of a freshly pasted image.                               */
+    GBytes *cached = g_object_get_data(G_OBJECT(pixbuf), "on-png");
+    if (cached != NULL)
+        return cached;
+
+    gchar  *png   = NULL;            /* freshly encoded bytes               */
+    gsize   n_png = 0;               /* their length                        */
+    GError *err   = NULL;            /* encode failure                      */
+    if (!gdk_pixbuf_save_to_buffer(pixbuf, &png, &n_png, "png", &err, NULL)) {
+        g_warning("image: PNG encode failed: %s",
+                  err != NULL ? err->message : "unknown");
+        g_clear_error(&err);
+        return NULL;
+    }
+
+    GBytes *bytes = g_bytes_new_take(png, n_png);
+    g_object_set_data_full(G_OBJECT(pixbuf), "on-png", bytes,
+                           (GDestroyNotify)g_bytes_unref);
+    return bytes;                    /* owned by the pixbuf                 */
+}
+
 /* ---------------------------------------------------------------------------
  * serialize_seg() — OnBufferSegFn writing each segment out as a BNBF record.
  * ------------------------------------------------------------------------- */
@@ -379,28 +406,7 @@ serialize_seg(const OnBufferSeg *seg, gpointer data)
         break;
 
     case ON_SEG_IMAGE: {
-        /* The pixbuf never changes once attached, so its PNG encoding is
-         * cached on it as "on-png" (attached at load time, or here on the
-         * first save of a freshly pasted image).  Without the cache every
-         * autosave re-compressed every image — the editor's biggest
-         * main-loop stall on image-heavy notes.                            */
-        GBytes *png_bytes =
-            g_object_get_data(G_OBJECT(seg->pixbuf), "on-png");
-        if (png_bytes == NULL) {
-            gchar *png   = NULL;     /* PNG bytes for the original          */
-            gsize  n_png = 0;        /* PNG byte count                      */
-            GError *err  = NULL;
-            if (gdk_pixbuf_save_to_buffer(seg->pixbuf, &png, &n_png,
-                                          "png", &err, NULL)) {
-                png_bytes = g_bytes_new_take(png, n_png);
-                g_object_set_data_full(G_OBJECT(seg->pixbuf), "on-png",
-                                       png_bytes,
-                                       (GDestroyNotify)g_bytes_unref);
-            } else {
-                g_warning("serialize: image save failed: %s", err->message);
-                g_clear_error(&err);
-            }
-        }
+        GBytes *png_bytes = on_image_png_bytes(seg->pixbuf);
         if (png_bytes != NULL) {
             gsize n_png = 0;         /* PNG byte count                      */
             gconstpointer png = g_bytes_get_data(png_bytes, &n_png);
@@ -926,8 +932,8 @@ on_note_count_images(const guint8 *data, gsize len)
     return n;
 }
 
-GdkPixbuf *
-on_note_image_nth(const guint8 *data, gsize len, gint ord, gint max_px)
+GBytes *
+on_note_image_nth_png(const guint8 *data, gsize len, gint ord)
 {
     OnBnbfReader r;                  /* the shared record walker            */
     if (data == NULL || ord < 0 || !bnbf_open(&r, data, len))
@@ -935,16 +941,78 @@ on_note_image_nth(const guint8 *data, gsize len, gint ord, gint max_px)
 
     gint n = 0;                      /* images seen so far                  */
     OnBnbfRecord rec;                /* the record being walked past        */
-    GdkPixbuf *out = NULL;           /* the one image we decode             */
+    GBytes *out = NULL;              /* the one payload we copy out         */
     while (bnbf_next(&r, &rec)) {
         if (rec.type == REC_TABLE) {
             on_table_free(rec.table);
         } else if (rec.type == REC_IMAGE && n++ == ord) {
-            out = png_decode_capped(rec.png, rec.n_png, max_px);
+            out = g_bytes_new(rec.png, rec.n_png);
             break;
         }
     }
     return out;
+}
+
+GdkPixbuf *
+on_note_image_nth(const guint8 *data, gsize len, gint ord, gint max_px)
+{
+    /* The copy the GBytes makes is one image's payload, alive only until
+     * the decode finishes — the media browser holds one at a time.        */
+    GBytes *png = on_note_image_nth_png(data, len, ord);
+    if (png == NULL)
+        return NULL;
+
+    gsize n_png;                     /* payload size                        */
+    const guint8 *bytes = g_bytes_get_data(png, &n_png);
+    GdkPixbuf *out = png_decode_capped(bytes, n_png, max_px);
+    g_bytes_unref(png);
+    return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * probe_size_prepared() — "size-prepared" handler for on_png_probe_size():
+ * records the image's declared dimensions and asks for nothing else.
+ * ------------------------------------------------------------------------- */
+static void
+probe_size_prepared(GdkPixbufLoader *loader, gint width, gint height,
+                    gpointer user_data)
+{
+    (void)loader;
+    gint *wh = user_data;            /* [0]=width, [1]=height               */
+    wh[0] = width;
+    wh[1] = height;
+}
+
+gboolean
+on_png_probe_size(const guint8 *png, gsize n_png, gint *w, gint *h)
+{
+    if (png == NULL || n_png == 0)
+        return FALSE;
+
+    gint wh[2] = { 0, 0 };           /* dimensions the header declares      */
+    GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+    g_signal_connect(loader, "size-prepared",
+                     G_CALLBACK(probe_size_prepared), wh);
+
+    /* A PNG declares its size in the IHDR chunk, within the first few dozen
+     * bytes, and the loader emits size-prepared as soon as it has read it —
+     * so feeding it the head of the file is enough.  Closing a loader that
+     * was given a truncated image fails; that error is expected and
+     * discarded, since the dimensions are already in hand.                 */
+    GError *err = NULL;              /* the expected truncation failure     */
+    gdk_pixbuf_loader_write(loader, png, MIN(n_png, 1024), &err);
+    g_clear_error(&err);
+    gdk_pixbuf_loader_close(loader, &err);
+    g_clear_error(&err);
+    g_object_unref(loader);
+
+    if (wh[0] <= 0 || wh[1] <= 0)
+        return FALSE;
+    if (w != NULL)
+        *w = wh[0];
+    if (h != NULL)
+        *h = wh[1];
+    return TRUE;
 }
 
 gchar *
@@ -985,36 +1053,6 @@ on_note_buffer_load(OnDatabase *db, gint64 id, gint max_img_px)
         g_free(blob);
     }
     return buffer;
-}
-
-/* text_contains() — literal substring test under the caller's case rules:
- * `needle_ci` non-NULL means case-insensitive, and is already casefolded so
- * only the haystack is folded here (once per note, not twice).              */
-static gboolean
-text_contains(const gchar *haystack, const gchar *needle,
-              const gchar *needle_ci)
-{
-    if (haystack == NULL)
-        return FALSE;
-    if (needle_ci == NULL)
-        return strstr(haystack, needle) != NULL;
-
-    gchar *folded = g_utf8_casefold(haystack, -1);
-    gboolean hit = strstr(folded, needle_ci) != NULL;
-    g_free(folded);
-    return hit;
-}
-
-gboolean
-on_note_text_matches(const gchar *title, const gchar *body,
-                     const gchar *query, const gchar *query_ci,
-                     GRegex *regex)
-{
-    if (regex != NULL)
-        return (title != NULL && g_regex_match(regex, title, 0, NULL)) ||
-               (body  != NULL && g_regex_match(regex, body,  0, NULL));
-    return text_contains(title, query, query_ci) ||
-           text_contains(body,  query, query_ci);
 }
 
 /* ---------------------------------------------------------------------------

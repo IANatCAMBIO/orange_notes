@@ -71,6 +71,7 @@ SRCS     := src/main.c \
             src/image_viewer.c \
             src/library_window.c \
             src/media_window.c \
+            src/search_query.c \
             src/search_window.c \
             src/settings_window.c \
             src/export.c

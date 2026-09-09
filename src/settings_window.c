@@ -33,28 +33,6 @@ svg_loader_available(void)
 }
 
 /* ---------------------------------------------------------------------------
- * on_style_combo_changed() — a toolbar-style combo changed: apply it to
- * the toolbar family stored on the combo as "on-kind".
- * Combo index order matches: 0=text, 1=icons, 2=icons above text.
- * ------------------------------------------------------------------------- */
-static void
-on_style_combo_changed(GtkComboBox *combo, gpointer user_data)
-{
-    OnApp *app = user_data;          /* application context                 */
-    static const GtkToolbarStyle STYLES[] = {
-        GTK_TOOLBAR_TEXT, GTK_TOOLBAR_ICONS, GTK_TOOLBAR_BOTH,
-    };
-    gint active = gtk_combo_box_get_active(combo);
-    if (active < 0 || active > 2)
-        return;
-    on_app_set_toolbar_style(
-        app,
-        (OnToolbarKind)GPOINTER_TO_INT(
-            g_object_get_data(G_OBJECT(combo), "on-kind")),
-        STYLES[active]);
-}
-
-/* ---------------------------------------------------------------------------
  * on_density_combo_changed() — List Density combo changed: update the field,
  * persist, and trigger a full notes-list refresh so row heights update.
  * ------------------------------------------------------------------------- */
@@ -67,33 +45,6 @@ on_density_combo_changed(GtkComboBox *combo, gpointer user_data)
                       app->comfortable_list ? "1" : "0");
     if (app->notify_notes_changed != NULL)
         app->notify_notes_changed(app);
-}
-
-/* ---------------------------------------------------------------------------
- * style_combo_new() — build one toolbar-style combo, pre-set to the
- * current style of toolbar family `kind`.
- * ------------------------------------------------------------------------- */
-static GtkWidget *
-style_combo_new(OnApp *app, OnToolbarKind kind)
-{
-    GtkWidget *combo = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo),
-                                   "Text only");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo),
-                                   "Icons only");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo),
-                                   "Icons above text");
-
-    gint active =                    /* combo index of the current style    */
-        (app->toolbar_style[kind] == GTK_TOOLBAR_TEXT)  ? 0
-      : (app->toolbar_style[kind] == GTK_TOOLBAR_ICONS) ? 1
-                                                        : 2;
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
-
-    g_object_set_data(G_OBJECT(combo), "on-kind", GINT_TO_POINTER(kind));
-    g_signal_connect(combo, "changed",
-                     G_CALLBACK(on_style_combo_changed), app);
-    return combo;
 }
 
 /* apply_notes_changed() — fire the library's full refresh, if installed.    */
@@ -470,21 +421,9 @@ on_settings_window_open(OnApp *app)
     gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
     gtk_widget_set_margin_start(grid, 12);
 
-    GtkWidget *lib_label = gtk_label_new("Library toolbar buttons:");
-    gtk_label_set_xalign(GTK_LABEL(lib_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), lib_label, 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid),
-                    style_combo_new(app, ON_TOOLBAR_LIBRARY), 1, 0, 1, 1);
-
-    GtkWidget *ed_label = gtk_label_new("Editor toolbar buttons:");
-    gtk_label_set_xalign(GTK_LABEL(ed_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), ed_label, 0, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid),
-                    style_combo_new(app, ON_TOOLBAR_EDITOR), 1, 1, 1, 1);
-
     GtkWidget *density_label = gtk_label_new("List density:");
     gtk_label_set_xalign(GTK_LABEL(density_label), 0.0);
-    gtk_grid_attach(GTK_GRID(grid), density_label, 0, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), density_label, 0, 0, 1, 1);
     GtkWidget *density_combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(density_combo),
                                    "Compact");
@@ -494,7 +433,7 @@ on_settings_window_open(OnApp *app)
                              app->comfortable_list ? 1 : 0);
     g_signal_connect(density_combo, "changed",
                      G_CALLBACK(on_density_combo_changed), app);
-    gtk_grid_attach(GTK_GRID(grid), density_combo, 1, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), density_combo, 1, 0, 1, 1);
 
     gtk_box_pack_start(GTK_BOX(vbox), grid, FALSE, FALSE, 0);
 

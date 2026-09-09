@@ -109,6 +109,11 @@ emit_table(OnExportCtx *ctx, OnTable *table)
  * emit_image() — render one embedded pixbuf.
  * HTML: inline base64 data URI.  Markdown: write "<base>-imgN.png" beside
  * the note file and reference it relatively.
+ *
+ * Both write the image's EXISTING encoding (on_image_png_bytes), which for
+ * anything loaded from a note is the PNG the database already holds: an
+ * export copies those bytes instead of recompressing every screenshot in
+ * the library, and what lands on disk is byte-identical to what was stored.
  *   ctx    — rendering context.
  *   pixbuf — the image.
  * ------------------------------------------------------------------------- */
@@ -117,31 +122,32 @@ emit_image(OnExportCtx *ctx, GdkPixbuf *pixbuf)
 {
     ctx->img_count++;
 
-    if (ctx->format == ON_EXPORT_HTML) {
-        gchar *png   = NULL;         /* PNG bytes                           */
-        gsize  n_png = 0;            /* PNG byte count                      */
-        GError *err  = NULL;
-        if (!gdk_pixbuf_save_to_buffer(pixbuf, &png, &n_png,
-                                       "png", &err, NULL)) {
-            g_warning("export: image encode failed: %s", err->message);
-            g_clear_error(&err);
-            return;
-        }
-        gchar *b64 = g_base64_encode((const guchar *)png, n_png);
-        g_string_append_printf(ctx->out,
-            "<img src=\"data:image/png;base64,%s\" alt=\"image\">", b64);
-        g_free(b64);
-        g_free(png);
-    } else if (ctx->note_dir == NULL) {
+    /* The placeholder form needs no bytes at all.                          */
+    if (ctx->format == ON_EXPORT_MARKDOWN && ctx->note_dir == NULL) {
         /* String render (on_export_note_markdown): there is no directory
          * for side-car files — leave a numbered placeholder instead.        */
         g_string_append_printf(ctx->out, "![image %d]()", ctx->img_count);
+        return;
+    }
+
+    GBytes *png_bytes = on_image_png_bytes(pixbuf);   /* borrowed           */
+    if (png_bytes == NULL)
+        return;                      /* already warned                      */
+    gsize n_png = 0;                 /* encoded byte count                  */
+    const guint8 *png = g_bytes_get_data(png_bytes, &n_png);
+
+    if (ctx->format == ON_EXPORT_HTML) {
+        gchar *b64 = g_base64_encode(png, n_png);
+        g_string_append_printf(ctx->out,
+            "<img src=\"data:image/png;base64,%s\" alt=\"image\">", b64);
+        g_free(b64);
     } else {
         gchar *img_name = g_strdup_printf("%s-img%d.png",
                                           ctx->base_name, ctx->img_count);
         gchar *img_path = g_build_filename(ctx->note_dir, img_name, NULL);
-        GError *err = NULL;
-        if (gdk_pixbuf_save(pixbuf, img_path, "png", &err, NULL))
+        GError *err = NULL;          /* write failure                       */
+        if (g_file_set_contents(img_path, (const gchar *)png, (gssize)n_png,
+                                &err))
             g_string_append_printf(ctx->out, "![image](%s)", img_name);
         else {
             g_warning("export: image write failed: %s", err->message);

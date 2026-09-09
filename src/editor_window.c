@@ -5005,11 +5005,10 @@ menu_tool_button_new(const gchar *markup, const gchar *tooltip,
 
 /* ---------------------------------------------------------------------------
  * build_toolbar() — construct the formatting toolbar: inline-style
- * toggles, paragraph-style buttons, code-block and image insertion.  The
- * toolbar is registered with the app so it follows the global
- * text/icons/both style preference.  In compact mode (File → Settings…)
- * the three paragraph-style buttons collapse into an "Aa" Styles menu
- * button and the three list buttons into a "≡" Lists one.
+ * toggles, paragraph-style buttons, code-block and image insertion.
+ * In compact mode (File → Settings…) the three paragraph-style buttons
+ * collapse into an "Aa" Styles menu button and the three list buttons
+ * into a "≡" Lists one.
  * Returns the toolbar widget.
  * ------------------------------------------------------------------------- */
 static GtkWidget *
@@ -5018,6 +5017,7 @@ build_toolbar(OnEditor *ed)
     GtkWidget *toolbar = gtk_toolbar_new();
     gtk_toolbar_set_icon_size(GTK_TOOLBAR(toolbar),
                               GTK_ICON_SIZE_SMALL_TOOLBAR);
+    gtk_toolbar_set_style(GTK_TOOLBAR(toolbar), GTK_TOOLBAR_ICONS);
     /* No overflow arrow: the toolbar then demands its full natural width,
      * which becomes the window's minimum — items can never be silently
      * clipped by narrowing the window.                                     */
@@ -5162,14 +5162,12 @@ build_toolbar(OnEditor *ed)
     gtk_container_add(GTK_CONTAINER(search_item), search_box);
     gtk_toolbar_insert(GTK_TOOLBAR(toolbar), search_item, -1);
 
-    on_app_register_toolbar(ed->app, ON_TOOLBAR_EDITOR, toolbar);
     return toolbar;
 }
 
 /* editor_rebuild_toolbar() — swap one editor's formatting toolbar for a
- * freshly built one.  Destroying the old toolbar unregisters it from the
- * style registry; the rebuild registers the new one and refreshes the
- * ed-> widget pointers (toggle_buttons, search_entry).                      */
+ * freshly built one, refreshing the ed-> widget pointers (toggle_buttons,
+ * search_entry).                                                           */
 static void
 editor_rebuild_toolbar(OnEditor *ed)
 {

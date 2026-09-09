@@ -3,8 +3,8 @@
  *
  * A single OnApp instance is created in main() and passed to every window.
  * It owns the database handle, tracks open editor windows, carries the
- * user's toolbar-style preference, and loads button icons from the
- * app-local icons/ folder (see on_app_icon_image_sized).
+ * user's preferences, and loads button icons from the app-local icons/
+ * folder (see on_app_icon_image_sized).
  * =========================================================================== */
 
 #ifndef BLUE_APP_H
@@ -49,13 +49,6 @@
  *                    message ("DB saved", …) on the right side of its
  *                    status bar.  Post through on_app_status(), which
  *                    handles the hook being NULL.
- *   toolbar_style  — how toolbar buttons render (text only, icons only,
- *                    or icons above text), kept separately for library
- *                    toolbars and editor toolbars.  Indexed by
- *                    OnToolbarKind; persisted in the ini.
- *   toolbars       — every live toolbar per kind, so a style change can
- *                    be applied to all open windows at once.  Entries
- *                    remove themselves on destroy.
  *   icons_dir      — absolute path of the local icons/ folder the button
  *                    icons (elementary SVGs) are loaded from (owned
  *                    string).
@@ -114,13 +107,6 @@
  *                    NULL when touch assistance is shown.
  * ------------------------------------------------------------------------- */
 
-/* Which family a toolbar belongs to — each has its own style setting.       */
-typedef enum {
-    ON_TOOLBAR_LIBRARY = 0,          /* library + sidebar toolbars          */
-    ON_TOOLBAR_EDITOR  = 1,          /* editor-window formatting toolbars   */
-    ON_TOOLBAR_N_KINDS
-} OnToolbarKind;
-
 typedef struct OnApp {
     GtkApplication  *gtk_app;
     OnDatabase      *db;
@@ -129,8 +115,6 @@ typedef struct OnApp {
     void           (*notify_notes_changed)(struct OnApp *app);
     void           (*notify_note_saved)(struct OnApp *app, gint64 note_id);
     void           (*notify_status)(struct OnApp *app, const gchar *message);
-    GtkToolbarStyle  toolbar_style[ON_TOOLBAR_N_KINDS];
-    GPtrArray       *toolbars[ON_TOOLBAR_N_KINDS];
     gchar           *icons_dir;
     gboolean         code_copy_buttons;
     gboolean         code_line_numbers;
@@ -249,8 +233,7 @@ cairo_surface_t *on_app_icon_surface(OnApp *app, const gchar *name,
                                      gint size);
 
 /* ---------------------------------------------------------------------------
- * on_app_tool_item_new() — create a toolbar button that honors the
- * app-wide toolbar style.
+ * on_app_tool_item_new() — create an icon toolbar button.
  *   app             — the application context.
  *   toggle          — TRUE for a GtkToggleToolButton, FALSE for a plain
  *                     GtkToolButton.
@@ -259,7 +242,9 @@ cairo_surface_t *on_app_icon_surface(OnApp *app, const gchar *name,
  *   fallback_markup — Pango markup rendered as the "icon" when the icon
  *                     file is missing (e.g. "<b>H1</b>"); NULL to fall
  *                     back to the plain label.
- *   label           — the button's text label (shown in text/both modes).
+ *   label           — the button's accessible text label; also the icon
+ *                     stand-in when both the icon file and
+ *                     fallback_markup are absent.
  *   tooltip         — hover help text.
  * Returns the new tool item (not yet shown).
  * ------------------------------------------------------------------------- */
@@ -268,27 +253,6 @@ GtkToolItem *on_app_tool_item_new(OnApp *app, gboolean toggle,
                                   const gchar *fallback_markup,
                                   const gchar *label,
                                   const gchar *tooltip);
-
-/* ---------------------------------------------------------------------------
- * on_app_register_toolbar() — apply the current style for `kind` to
- * `toolbar` and keep it updated when that style changes.  The toolbar
- * unregisters itself automatically when destroyed.
- * ------------------------------------------------------------------------- */
-void on_app_register_toolbar(OnApp *app, OnToolbarKind kind,
-                             GtkWidget *toolbar);
-
-/* ---------------------------------------------------------------------------
- * on_app_set_toolbar_style() — change one toolbar family's style on every
- * live toolbar of that kind and persist the choice.
- * ------------------------------------------------------------------------- */
-void on_app_set_toolbar_style(OnApp *app, OnToolbarKind kind,
-                              GtkToolbarStyle style);
-
-/* ---------------------------------------------------------------------------
- * on_app_load_toolbar_styles() — read both persisted toolbar styles into
- * app->toolbar_style[] (defaulting to icons-above-text when unset).
- * ------------------------------------------------------------------------- */
-void on_app_load_toolbar_styles(OnApp *app);
 
 /* ---------------------------------------------------------------------------
  * on_app_config_init() — resolve the application config file once

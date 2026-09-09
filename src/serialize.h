@@ -286,24 +286,6 @@ GtkTextBuffer *on_note_buffer_load(OnDatabase *db, gint64 id,
                                    gint max_img_px);
 
 /* ---------------------------------------------------------------------------
- * on_note_text_matches() — does a note match a search query?  Title or body
- * counts as a hit.  THE matching rule, shared by the search window's worker
- * thread and the headless `search` command, which each used to spell it out
- * (and disagree about how much casefolding to do).
- *   title    — the note's title.
- *   body     — its plain text (see on_note_text_cached).
- *   query    — the literal needle; ignored when `regex` is non-NULL.
- *   query_ci — `query` pre-casefolded ONCE by the caller for
- *              case-insensitive literal matching, or NULL for a
- *              case-sensitive comparison.  Ignored when `regex` is set.
- *   regex    — compiled pattern for regex mode, or NULL for literal mode.
- *              GRegex is immutable, so one may be shared across threads.
- * ------------------------------------------------------------------------- */
-gboolean on_note_text_matches(const gchar *title, const gchar *body,
-                              const gchar *query, const gchar *query_ci,
-                              GRegex *regex);
-
-/* ---------------------------------------------------------------------------
  * on_note_extract_actions() — pull the ACTION ITEMS out of a BNBF blob
  * without building a GtkTextBuffer (same cheap record walk as
  * on_note_extract_text).  An action item is a line whose first character
@@ -410,6 +392,45 @@ gint on_note_count_images(const guint8 *data, gsize len);
  * ------------------------------------------------------------------------- */
 GdkPixbuf *on_note_image_nth(const guint8 *data, gsize len, gint ord,
                              gint max_px);
+
+/* ---------------------------------------------------------------------------
+ * on_image_png_bytes() — THE PNG encoding of one attached image.
+ *
+ * A pixbuf that came out of a note carries its ORIGINAL bytes cached on it
+ * as "on-png" (attached by the full-resolution load), and a pixbuf that did
+ * not is encoded once and cached the same way.  So an image is compressed
+ * at most once per session however many times it is written out — which is
+ * the whole reason saving an image-heavy note is not a main-loop stall, and
+ * why exporting one does not recompress what the database already holds.
+ *   pixbuf — the image, as carried by an anchor (on_anchor_get_image).
+ * Returns BORROWED bytes owned by the pixbuf — do not unref — or NULL when
+ * the image could not be encoded.
+ * ------------------------------------------------------------------------- */
+GBytes *on_image_png_bytes(GdkPixbuf *pixbuf);
+
+/* ---------------------------------------------------------------------------
+ * on_note_image_nth_png() — the ENCODED bytes of one embedded image, taken
+ * verbatim out of the blob: THE walk on_note_image_nth() decodes through, and
+ * what a caller that only wants to WRITE the image out should use, since
+ * decoding and re-encoding a PNG costs time and loses the original bytes.
+ *   data — BNBF bytes (NULL yields NULL).
+ *   len  — length of `data`.
+ *   ord  — 0-based image ordinal within the note.
+ * Returns a new GBytes holding a copy of the payload (g_bytes_unref() it),
+ * or NULL when the note has no such image.
+ * ------------------------------------------------------------------------- */
+GBytes *on_note_image_nth_png(const guint8 *data, gsize len, gint ord);
+
+/* ---------------------------------------------------------------------------
+ * on_png_probe_size() — an encoded image's pixel dimensions from its HEADER,
+ * without decoding the pixels: the loader is fed only the first bytes and
+ * then closed, so a 12 MP screenshot costs nothing to measure.
+ *   png   — encoded bytes.
+ *   n_png — their length.
+ *   w/h   — receive the dimensions (either may be NULL).
+ * Returns TRUE when the header parsed.
+ * ------------------------------------------------------------------------- */
+gboolean on_png_probe_size(const guint8 *png, gsize n_png, gint *w, gint *h);
 
 /* ---------------------------------------------------------------------------
  * OnTable — the data behind an embedded table anchor.

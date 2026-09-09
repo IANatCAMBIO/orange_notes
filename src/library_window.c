@@ -2922,15 +2922,6 @@ utf8_casecmp(const gchar *a, const gchar *b)
     return result;
 }
 
-/* folder_name_cmp() — GCompareFunc: case-insensitive alphabetical order
- * of two OnFolder*s.                                                        */
-static gint
-folder_name_cmp(gconstpointer a, gconstpointer b)
-{
-    const OnFolder *fa = a, *fb = b;
-    return utf8_casecmp(fa->name, fb->name);
-}
-
 /* ---------------------------------------------------------------------------
  * on_sort_subfolders() — folder context menu: order the selected
  * folder's (or the root's) DIRECT children alphabetically and persist
@@ -2947,21 +2938,11 @@ on_sort_subfolders(GtkWidget *widget, gpointer user_data)
     gint64 parent =                  /* whose children get sorted           */
         (lw->sel_kind == SB_KIND_FOLDER) ? lw->sel_id : 0;
 
-    GList *kids = on_db_folder_list(lw->app->db, parent);
-    kids = g_list_sort(kids, folder_name_cmp);
-    GArray *ids = g_array_new(FALSE, FALSE, sizeof(gint64));
-    for (GList *l = kids; l != NULL; l = l->next)
-        g_array_append_val(ids, ((OnFolder *)l->data)->id);
-    on_db_folder_list_free(kids);
-
-    if (ids->len > 1 &&
-        on_db_folder_reorder(lw->app->db, (const gint64 *)ids->data,
-                             ids->len)) {
-        on_app_status(lw->app, "Sorted %u subfolders alphabetically",
-                      ids->len);
+    gint n = on_db_folder_sort_children(lw->app->db, parent);
+    if (n > 1) {
+        on_app_status(lw->app, "Sorted %d subfolders alphabetically", n);
         refresh_all(lw);
     }
-    g_array_free(ids, TRUE);
 }
 
 /* ---------------------------------------------------------------------------
@@ -4880,6 +4861,7 @@ build_action_bar(OnLibrary *lw)
     GtkWidget *toolbar = gtk_toolbar_new();
     gtk_toolbar_set_icon_size(GTK_TOOLBAR(toolbar),
                               GTK_ICON_SIZE_SMALL_TOOLBAR);
+    gtk_toolbar_set_style(GTK_TOOLBAR(toolbar), GTK_TOOLBAR_ICONS);
 
     /* --- folder area ---------------------------------------------------- */
     add_tool_button(lw, toolbar, "sidebar", "\xe2\x97\xa7",
@@ -4966,7 +4948,6 @@ build_action_bar(OnLibrary *lw)
     gtk_container_add(GTK_CONTAINER(entry_item), entry);
     gtk_toolbar_insert(GTK_TOOLBAR(toolbar), entry_item, -1);
 
-    on_app_register_toolbar(lw->app, ON_TOOLBAR_LIBRARY, toolbar);
     return toolbar;
 }
 

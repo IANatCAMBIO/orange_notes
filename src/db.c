@@ -658,6 +658,40 @@ on_db_folder_reorder(OnDatabase *db, const gint64 *folder_ids, gsize n)
                         folder_ids, n);
 }
 
+/* folder_name_cmp() — GCompareFunc ordering two OnFolder* by casefolded
+ * name, the comparison on_db_folder_sort_children() persists.              */
+static gint
+folder_name_cmp(gconstpointer a, gconstpointer b)
+{
+    const OnFolder *fa = a, *fb = b;
+    gchar *ca = g_utf8_casefold(fa->name != NULL ? fa->name : "", -1);
+    gchar *cb = g_utf8_casefold(fb->name != NULL ? fb->name : "", -1);
+    gint result = g_strcmp0(ca, cb);
+    g_free(ca);
+    g_free(cb);
+    return result;
+}
+
+gint
+on_db_folder_sort_children(OnDatabase *db, gint64 parent_id)
+{
+    GList *kids = on_db_folder_list(db, parent_id);
+    kids = g_list_sort(kids, folder_name_cmp);
+
+    GArray *ids = g_array_new(FALSE, FALSE, sizeof(gint64));
+    for (GList *l = kids; l != NULL; l = l->next)
+        g_array_append_val(ids, ((OnFolder *)l->data)->id);
+    on_db_folder_list_free(kids);
+
+    /* Nothing to persist for an empty or single-child folder.              */
+    gint n = (gint)ids->len;
+    gboolean ok = (ids->len < 2) ||
+                  on_db_folder_reorder(db, (const gint64 *)ids->data,
+                                       ids->len);
+    g_array_free(ids, TRUE);
+    return ok ? n : -1;
+}
+
 gboolean
 on_db_folder_delete(OnDatabase *db, gint64 id)
 {
@@ -1760,9 +1794,11 @@ on_db_folder_restore(OnDatabase *db, gint64 id)
 GList *
 on_db_folder_list_trashed(OnDatabase *db)
 {
+    /* FOLDER_COLS, like every other folder query: run_folder_query() reads
+     * the columns positionally, so a hand-written list here silently loaded
+     * parent_id as the name (and the name as the emoji).                   */
     sqlite3_stmt *stmt = prepare(db,
-        "SELECT id, COALESCE(parent_id,0), name, sort_order, "
-        "COALESCE(emoji,'') FROM folders "
+        "SELECT " FOLDER_COLS " FROM folders "
         "WHERE trashed=1 ORDER BY name COLLATE NOCASE");
     if (stmt == NULL)
         return NULL;
@@ -1847,6 +1883,17 @@ on_db_trash_empty(OnDatabase *db)
 /* =========================================================================
  * counts
  * ========================================================================= */
+
+gboolean
+on_db_note_is_trashed(OnDatabase *db, gint64 id)
+{
+    /* Ask for the note by id AND the visibility rule: a row comes back only
+     * when it exists and is visible, so "no row" means trashed — or gone,
+     * which the callers have already ruled out.                            */
+    return query_int64(db,
+        "SELECT COUNT(*) FROM notes WHERE id=? AND " NOTE_VISIBLE_SQL,
+        id) == 0;
+}
 
 gint
 on_db_note_count_visible(OnDatabase *db)

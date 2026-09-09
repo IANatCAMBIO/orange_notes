@@ -3,8 +3,6 @@
 # (~/.local/share/notes/notes.db).
 [notes]
 db_dir=
-toolbar_style_library=icons
-toolbar_style_editor=icons
 code_copy_button=1
 code_line_numbers=1
 native_menubar=1

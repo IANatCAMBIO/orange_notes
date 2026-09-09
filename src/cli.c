@@ -18,6 +18,7 @@
 #include "editor_window.h"           /* action done/due content rewrites    */
 #include "export.h"
 #include "ipc.h"
+#include "search_query.h"
 #include "serialize.h"
 
 #include <stdio.h>
@@ -33,6 +34,115 @@ void
 on_cli_set_stdin_data(const gchar *data)
 {
     cli_stdin_data = data;
+}
+
+/* ===========================================================================
+ * machine-readable output
+ *
+ * Every listing command takes --json and emits the same records as one JSON
+ * array instead of tab-separated lines.  The point is that a note title, a
+ * folder name or an action item's text may itself contain a tab, which
+ * silently shifts the columns of the plain form; JSON has one unambiguous
+ * escape for that (and for the newlines "note cat --json" carries).
+ *
+ * The flag is stripped from argv by the dispatcher (see cli_json_take), so
+ * each verb still validates its own argument count.  It is assigned on every
+ * dispatch, never OR-ed in: inside a GUI instance serving remote CLI calls
+ * these statics outlive the command.
+ * =========================================================================== */
+
+static gboolean cli_json   = FALSE;  /* --json: emit JSON, not TSV          */
+static gboolean json_first = TRUE;   /* next element needs no leading comma */
+
+/* ---------------------------------------------------------------------------
+ * json_str() — print one JSON string literal, quoted and escaped.  The text
+ * is UTF-8 (validated on the way into the database), which JSON takes
+ * verbatim, so only the quote, the backslash and the C0 controls are
+ * rewritten.  A NULL prints as the JSON null.
+ * ------------------------------------------------------------------------- */
+static void
+json_str(const gchar *s)
+{
+    if (s == NULL) {
+        fputs("null", stdout);
+        return;
+    }
+    putchar('"');
+    for (const guchar *p = (const guchar *)s; *p != '\0'; p++) {
+        switch (*p) {
+        case '"':  fputs("\\\"", stdout); break;
+        case '\\': fputs("\\\\", stdout); break;
+        case '\n': fputs("\\n", stdout);  break;
+        case '\r': fputs("\\r", stdout);  break;
+        case '\t': fputs("\\t", stdout);  break;
+        case '\b': fputs("\\b", stdout);  break;
+        case '\f': fputs("\\f", stdout);  break;
+        default:
+            if (*p < 0x20)
+                printf("\\u%04x", *p);
+            else
+                putchar((gchar)*p);
+        }
+    }
+    putchar('"');
+}
+
+/* ---------------------------------------------------------------------------
+ * cli_time_str() — THE CLI's timestamp rendering: a UNIX time as local
+ * "YYYY-MM-DD HH:MM" (or "%Y-%m-%d" alone for a due date, which carries no
+ * time of day).  Every command printed this with its own four-line
+ * GDateTime dance before.
+ * Returns a newly allocated string; g_free() it.
+ * ------------------------------------------------------------------------- */
+static gchar *
+cli_time_str(gint64 unix_ts, gboolean date_only)
+{
+    GDateTime *dt = g_date_time_new_from_unix_local(unix_ts);
+    gchar *out = g_date_time_format(dt, date_only ? "%Y-%m-%d"
+                                                  : "%Y-%m-%d %H:%M");
+    g_date_time_unref(dt);
+    return out;
+}
+
+/* json_time() — print a timestamp as the pair every record carries: the
+ * same "YYYY-MM-DD HH:MM" string the plain output shows, under `key`, plus
+ * the raw UNIX seconds under "<key>_at" for anything doing arithmetic.     */
+static void
+json_time(const gchar *key, gint64 unix_ts)
+{
+    gchar *when = cli_time_str(unix_ts, FALSE);
+    printf("\"%s\":", key);
+    json_str(when);
+    printf(",\"%s_at\":%" G_GINT64_FORMAT, key, unix_ts);
+    g_free(when);
+}
+
+/* Array framing.  Each is a no-op in plain mode, so a command's printing
+ * loop reads the same either way: begin, one element per record, end.      */
+static void
+json_array_begin(void)
+{
+    if (cli_json) {
+        putchar('[');
+        json_first = TRUE;
+    }
+}
+
+static void
+json_element(void)
+{
+    if (cli_json) {
+        if (!json_first)
+            putchar(',');
+        json_first = FALSE;
+    }
+}
+
+static void
+json_array_end(void)
+{
+    if (cli_json)
+        fputs("]\n", stdout);
 }
 
 /* ---------------------------------------------------------------------------
@@ -164,6 +274,24 @@ cli_read_content(const gchar *arg)
 }
 
 /* ---------------------------------------------------------------------------
+ * buffer_append_iter() — put `end` at the buffer's end, ready to append,
+ * inserting `sep` first when the buffer already holds something and the end
+ * is mid-line.  What "append to a note" means in three places: plain text
+ * and an image start a fresh line ("\n"), a #tag token only wants a space.
+ *   buffer — the note being extended.
+ *   end    — receives the append position.
+ *   sep    — separator to insert first, or NULL for none.
+ * ------------------------------------------------------------------------- */
+static void
+buffer_append_iter(GtkTextBuffer *buffer, GtkTextIter *end, const gchar *sep)
+{
+    gtk_text_buffer_get_end_iter(buffer, end);
+    if (sep != NULL && gtk_text_buffer_get_char_count(buffer) > 0 &&
+        !gtk_text_iter_starts_line(end))
+        gtk_text_buffer_insert(buffer, end, sep, -1);
+}
+
+/* ---------------------------------------------------------------------------
  * note_buffer_save() — serialize `buffer` and persist it as note `id`'s
  * content: title from the first line, searchable body text refreshed —
  * the same trio every editor save writes.  Returns TRUE on success.
@@ -217,11 +345,20 @@ cmd_list_tags(OnDatabase *db)
 {
     GHashTable *counts = on_db_tag_count_map(db);   /* tag id → note count  */
     GList *tags = on_db_tag_list(db);
+    json_array_begin();
     for (GList *l = tags; l != NULL; l = l->next) {
-        OnTag *t = l->data;
-        printf("%s\t%d\n", t->name,
-               GPOINTER_TO_INT(g_hash_table_lookup(counts, &t->id)));
+        OnTag *t = l->data;          /* one tag                             */
+        gint n = GPOINTER_TO_INT(g_hash_table_lookup(counts, &t->id));
+        if (cli_json) {
+            json_element();
+            printf("{\"id\":%" G_GINT64_FORMAT ",\"name\":", t->id);
+            json_str(t->name);
+            printf(",\"notes\":%d}", n);
+        } else {
+            printf("%s\t%d\n", t->name, n);
+        }
     }
+    json_array_end();
     on_db_tag_list_free(tags);
     g_hash_table_destroy(counts);
     return 0;
@@ -247,8 +384,10 @@ cmd_delete_tag(OnDatabase *db, const gchar *name)
     return 0;
 }
 
-/* Forward declaration (defined with the other note-line printers below).   */
-static void print_note_line(OnNoteMeta *m, const gchar *folder_path);
+/* Forward declarations (defined with the other note-line printers below). */
+static void print_note_line(OnNoteMeta *m, GHashTable *paths);
+static void print_note_list(GList *notes, GHashTable *paths);
+static GHashTable *cli_paths_for(OnDatabase *db, gboolean want_path);
 
 /* cmd_tag_notes() — list every note labeled with one tag.                   */
 static int
@@ -263,27 +402,48 @@ cmd_tag_notes(OnDatabase *db, const gchar *name)
         return 2;
     }
     GList *notes = on_db_notes_by_tag(db, id);
-    for (GList *l = notes; l != NULL; l = l->next)
-        print_note_line(l->data, NULL);
+    GHashTable *paths = cli_paths_for(db, FALSE);   /* JSON needs the paths */
+    print_note_list(notes, paths);
+    if (paths != NULL)
+        g_hash_table_destroy(paths);
     on_db_note_list_free(notes);
     return 0;
 }
 
 /* ---------------------------------------------------------------------------
- * print_folder_tree() — recursive indented listing with note counts.
+ * print_folder_tree() — recursive listing with note counts: indented names
+ * in plain mode, one flat object per folder in JSON.  The JSON form is
+ * deliberately FLAT rather than nested — the tree is already in each
+ * folder's "path", and a flat array is what a caller can filter.
  *   counts — folder id → note count map (on_db_note_count_map), fetched
  *            once by cmd_list_folders; a missing key means zero.
+ *   parent — folder whose children this call prints (0 = top level).
+ *   depth  — recursion depth, driving the plain form's indent.
+ *   prefix — the parent's "Folder/Sub" path, "" at the top level.
  * ------------------------------------------------------------------------- */
 static void
 print_folder_tree(OnDatabase *db, GHashTable *counts, gint64 parent,
-                  gint depth)
+                  gint depth, const gchar *prefix)
 {
     GList *folders = on_db_folder_list(db, parent);
     for (GList *l = folders; l != NULL; l = l->next) {
-        OnFolder *f = l->data;
-        printf("%*s%s\t%d\n", depth * 2, "", f->name,
-               GPOINTER_TO_INT(g_hash_table_lookup(counts, &f->id)));
-        print_folder_tree(db, counts, f->id, depth + 1);
+        OnFolder *f = l->data;       /* one child folder                    */
+        gint n = GPOINTER_TO_INT(g_hash_table_lookup(counts, &f->id));
+        gchar *path = g_strdup_printf("%s/%s", prefix, f->name);
+        if (cli_json) {
+            json_element();
+            printf("{\"id\":%" G_GINT64_FORMAT ",\"name\":", f->id);
+            json_str(f->name);
+            printf(",\"path\":");
+            json_str(path);
+            printf(",\"parent_id\":%" G_GINT64_FORMAT ",\"emoji\":", parent);
+            json_str(f->emoji);
+            printf(",\"notes\":%d}", n);
+        } else {
+            printf("%*s%s\t%d\n", depth * 2, "", f->name, n);
+        }
+        print_folder_tree(db, counts, f->id, depth + 1, path);
+        g_free(path);
     }
     on_db_folder_list_free(folders);
 }
@@ -292,7 +452,9 @@ static int
 cmd_list_folders(OnDatabase *db)
 {
     GHashTable *counts = on_db_note_count_map(db);  /* one query, not per row */
-    print_folder_tree(db, counts, 0, 0);
+    json_array_begin();
+    print_folder_tree(db, counts, 0, 0, "");
+    json_array_end();
     g_hash_table_destroy(counts);
     return 0;
 }
@@ -307,6 +469,244 @@ cmd_add_folder(OnDatabase *db, const gchar *path)
         return 2;
     }
     printf("folder %s (id %" G_GINT64_FORMAT ")\n", path, id);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * folder_from_arg() — resolve a folder-path argument to its id, refusing
+ * the root: every command here acts ON a folder, and the root is not one.
+ *   db   — open database.
+ *   path — the path as typed ("A/B/C").
+ * Returns TRUE with *out_id set, or FALSE after printing an error.
+ * ------------------------------------------------------------------------- */
+static gboolean
+folder_from_arg(OnDatabase *db, const gchar *path, gint64 *out_id)
+{
+    if (!on_cli_resolve_folder_path(db, path, FALSE, out_id) || *out_id == 0) {
+        fprintf(stderr, "error: no such folder: %s\n", path);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------------------
+ * ai_mode_name() / ai_mode_parse() — the folder Info dialog's AI mode as a
+ * CLI word.  THE mapping, so the reader and the writer cannot drift.
+ * ------------------------------------------------------------------------- */
+static const gchar *
+ai_mode_name(gint mode)
+{
+    switch (mode) {
+    case ON_AI_MODE_PROJECT: return "project";
+    case ON_AI_MODE_CUSTOM:  return "custom";
+    default:                 return "normal";
+    }
+}
+
+static gboolean
+ai_mode_parse(const gchar *word, gint *out_mode)
+{
+    if (g_strcmp0(word, "normal") == 0)
+        *out_mode = ON_AI_MODE_NORMAL;
+    else if (g_strcmp0(word, "project") == 0)
+        *out_mode = ON_AI_MODE_PROJECT;
+    else if (g_strcmp0(word, "custom") == 0)
+        *out_mode = ON_AI_MODE_CUSTOM;
+    else
+        return FALSE;
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_folder_info() — everything the folder's Info dialog shows, as
+ * "key<TAB>value" lines (or one JSON object): id, path, name, emoji, AI
+ * mode, and how many notes and direct subfolders it holds.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_folder_info(OnDatabase *db, const gchar *path)
+{
+    gint64 id;                       /* the folder in question              */
+    if (!folder_from_arg(db, path, &id))
+        return 2;
+
+    gchar *full  = on_db_folder_path(db, id);   /* "Folder/Sub" (owned)   */
+    gchar *emoji = on_db_folder_get_emoji(db, id);
+    gint   mode  = on_db_folder_get_ai_mode(db, id);
+    /* The name is the last component of the path — no separate query.      */
+    const gchar *name = (full != NULL) ? full : "";
+    const gchar *slash = strrchr(name, '/');
+    if (slash != NULL)
+        name = slash + 1;
+
+    GList *notes = on_db_note_list(db, id);
+    gint n_notes = (gint)g_list_length(notes);
+    on_db_note_list_free(notes);
+    GList *subs = on_db_folder_list(db, id);
+    gint n_subs = (gint)g_list_length(subs);
+    on_db_folder_list_free(subs);
+
+    if (cli_json) {
+        printf("{\"id\":%" G_GINT64_FORMAT ",\"name\":", id);
+        json_str(name);
+        printf(",\"path\":");
+        json_str(full != NULL ? full : "");
+        printf(",\"emoji\":");
+        json_str(emoji);
+        printf(",\"ai_mode\":");
+        json_str(ai_mode_name(mode));
+        printf(",\"notes\":%d,\"subfolders\":%d}\n", n_notes, n_subs);
+    } else {
+        printf("id\t%" G_GINT64_FORMAT "\n", id);
+        printf("path\t/%s\n", full != NULL ? full : "");
+        printf("name\t%s\n", name);
+        printf("emoji\t%s\n", *emoji != '\0' ? emoji : "-");
+        printf("ai-mode\t%s\n", ai_mode_name(mode));
+        printf("notes\t%d\n", n_notes);
+        printf("subfolders\t%d\n", n_subs);
+    }
+    g_free(full);
+    g_free(emoji);
+    return 0;
+}
+
+/* cmd_folder_rename() — give a folder a new name, in place.                 */
+static int
+cmd_folder_rename(OnDatabase *db, const gchar *path, const gchar *name)
+{
+    gint64 id;                       /* the folder to rename                */
+    if (!folder_from_arg(db, path, &id))
+        return 2;
+    if (name == NULL || *name == '\0' || strchr(name, '/') != NULL) {
+        fprintf(stderr, "error: bad folder name: %s "
+                        "(non-empty, and no '/')\n", name);
+        return 2;
+    }
+    if (!on_db_folder_rename(db, id, name)) {
+        fprintf(stderr, "error: could not rename folder %s\n", path);
+        return 2;
+    }
+    printf("renamed folder %s -> %s\n", path, name);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_folder_move() — re-nest a folder (with its whole subtree) under a
+ * destination path, "/" meaning the top level.  The database refuses to
+ * move a folder into itself or one of its own descendants.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_folder_move(OnDatabase *db, const gchar *path, const gchar *dest)
+{
+    gint64 id;                       /* the folder to move                  */
+    if (!folder_from_arg(db, path, &id))
+        return 2;
+    gint64 parent;                   /* destination parent (0 = top level)  */
+    if (!on_cli_resolve_folder_path(db, dest, FALSE, &parent)) {
+        fprintf(stderr, "error: no such folder: %s\n", dest);
+        return 2;
+    }
+    if (!on_db_folder_move(db, id, parent)) {
+        fprintf(stderr, "error: could not move %s into %s "
+                        "(a folder cannot contain itself)\n",
+                path, *dest != '\0' ? dest : "/");
+        return 2;
+    }
+    printf("moved folder %s -> %s\n", path, *dest != '\0' ? dest : "/");
+    return 0;
+}
+
+/* cmd_folder_emoji() — set the folder's sidebar emoji prefix ("-" clears). */
+static int
+cmd_folder_emoji(OnDatabase *db, const gchar *path, const gchar *emoji)
+{
+    gint64 id;                       /* the folder to label                 */
+    if (!folder_from_arg(db, path, &id))
+        return 2;
+    const gchar *value = (g_strcmp0(emoji, "-") == 0) ? "" : emoji;
+    if (!g_utf8_validate(value, -1, NULL)) {
+        fprintf(stderr, "error: emoji is not valid UTF-8\n");
+        return 2;
+    }
+    if (!on_db_folder_set_emoji(db, id, value)) {
+        fprintf(stderr, "error: could not set emoji on %s\n", path);
+        return 2;
+    }
+    if (*value != '\0')
+        printf("set emoji %s on folder %s\n", value, path);
+    else
+        printf("cleared emoji on folder %s\n", path);
+    return 0;
+}
+
+/* cmd_folder_ai_mode() — set the folder's AI mode (its Info dialog's third
+ * field): normal, project or custom.                                        */
+static int
+cmd_folder_ai_mode(OnDatabase *db, const gchar *path, const gchar *word)
+{
+    gint64 id;                       /* the folder to configure             */
+    if (!folder_from_arg(db, path, &id))
+        return 2;
+    gint mode;                       /* parsed ON_AI_MODE_*                 */
+    if (!ai_mode_parse(word, &mode)) {
+        fprintf(stderr, "error: bad AI mode: %s "
+                        "(normal, project or custom)\n", word);
+        return 2;
+    }
+    if (!on_db_folder_set_ai_mode(db, id, mode)) {
+        fprintf(stderr, "error: could not set AI mode on %s\n", path);
+        return 2;
+    }
+    printf("set ai-mode %s on folder %s\n", ai_mode_name(mode), path);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_folder_sort() — order one folder's DIRECT children alphabetically,
+ * the folder context menu's "Sort Subfolders Alphabetically".  A path of
+ * "/" sorts the top level.  Case-insensitive, like the menu item.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_folder_sort(OnDatabase *db, const gchar *path)
+{
+    gint64 id;                       /* parent whose children get sorted    */
+    if (!on_cli_resolve_folder_path(db, path, FALSE, &id)) {
+        fprintf(stderr, "error: no such folder: %s\n", path);
+        return 2;
+    }
+
+    gint n = on_db_folder_sort_children(db, id);
+    if (n < 0) {
+        fprintf(stderr, "error: could not sort %s\n", path);
+        return 2;
+    }
+    printf("sorted %d subfolder%s of %s\n", n, n == 1 ? "" : "s",
+           *path != '\0' ? path : "/");
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_folder_restore() — take a folder out of the Trash, by ID rather than
+ * by path: a trashed folder is absent from the normal listings the path
+ * walker uses, so `trash list` is where its id comes from.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_folder_restore(OnDatabase *db, const gchar *id_str)
+{
+    gchar *endp = NULL;              /* end of the parsed id                */
+    gint64 id = g_ascii_strtoll(id_str, &endp, 10);
+    if (id <= 0 || endp == NULL || *endp != '\0') {
+        fprintf(stderr, "error: bad folder id: %s "
+                        "(see 'trash list')\n", id_str);
+        return 2;
+    }
+    if (!on_db_folder_restore(db, id)) {
+        fprintf(stderr, "error: could not restore folder %s\n", id_str);
+        return 2;
+    }
+    gchar *path = on_db_folder_path(db, id);
+    printf("restored folder %" G_GINT64_FORMAT "\t/%s\n",
+           id, path != NULL ? path : "");
+    g_free(path);
     return 0;
 }
 
@@ -335,31 +735,105 @@ cmd_delete_folder(OnDatabase *db, const gchar *path, gboolean permanent)
 }
 
 /* ---------------------------------------------------------------------------
- * print_note_line() — "ID<TAB>MODIFIED<TAB>TITLE", or with a non-NULL
- * `folder_path` (the "Folder/Sub" form on_db_folder_path_map yields; ""
- * for the top level) "ID<TAB>MODIFIED<TAB>/Folder/Sub/TITLE".
+ * note_path_of() — a note's "/Folder/Sub/Title" display path, built from the
+ * pre-fetched folder-path map (one query for a whole listing, never one per
+ * note — see on_db_folder_path_map).  A NULL map, or a folder missing from
+ * it, yields the top-level form "/Title".
+ * Returns a newly allocated string.
+ * ------------------------------------------------------------------------- */
+static gchar *
+note_path_of(OnNoteMeta *m, GHashTable *paths)
+{
+    const gchar *fpath = (paths != NULL)
+                         ? g_hash_table_lookup(paths, &m->folder_id) : NULL;
+    if (fpath == NULL)
+        fpath = "";
+    return g_strdup_printf("/%s%s%s", fpath,
+                           *fpath != '\0' ? "/" : "", m->title);
+}
+
+/* ---------------------------------------------------------------------------
+ * print_note_line() — THE note record, in whichever format is in force.
+ *
+ * Plain: "ID<TAB>MODIFIED<TAB>TITLE", or with a non-NULL `paths` map
+ * "ID<TAB>MODIFIED<TAB>/Folder/Sub/TITLE".
+ * JSON:  one object carrying every field, the path included — so a JSON
+ * caller must ALWAYS pass the map (each such command fetches it when
+ * cli_json is set), or every note would claim to sit at the top level.
  * ------------------------------------------------------------------------- */
 static void
-print_note_line(OnNoteMeta *m, const gchar *folder_path)
+print_note_line(OnNoteMeta *m, GHashTable *paths)
 {
-    GDateTime *dt = g_date_time_new_from_unix_local(m->updated_at);
-    gchar *when = g_date_time_format(dt, "%Y-%m-%d %H:%M");
-    g_date_time_unref(dt);
-    if (folder_path != NULL)
-        printf("%" G_GINT64_FORMAT "\t%s\t/%s%s%s\n", m->id, when,
-               folder_path, *folder_path != '\0' ? "/" : "", m->title);
-    else
+    if (cli_json) {
+        gchar *full = note_path_of(m, paths);   /* display path (owned)     */
+        json_element();
+        printf("{\"id\":%" G_GINT64_FORMAT ",\"title\":", m->id);
+        json_str(m->title);
+        printf(",\"path\":");
+        json_str(full);
+        printf(",\"folder_id\":%" G_GINT64_FORMAT ",", m->folder_id);
+        json_time("modified", m->updated_at);
+        putchar(',');
+        json_time("created", m->created_at);
+        printf(",\"pinned\":%s}", m->pinned ? "true" : "false");
+        g_free(full);
+        return;
+    }
+
+    gchar *when = cli_time_str(m->updated_at, FALSE);
+    if (paths != NULL) {
+        gchar *full = note_path_of(m, paths);   /* display path (owned)     */
+        printf("%" G_GINT64_FORMAT "\t%s\t%s\n", m->id, when, full);
+        g_free(full);
+    } else {
         printf("%" G_GINT64_FORMAT "\t%s\t%s\n", m->id, when, m->title);
+    }
     g_free(when);
 }
 
-/* cmd_list_notes() — notes in one folder, or every note with --all.         */
+/* ---------------------------------------------------------------------------
+ * print_note_list() — a whole result set of notes, framed as a JSON array
+ * when --json is in force and as bare lines otherwise.  Every command that
+ * prints notes goes through here so all of them gain both formats at once.
+ *   notes — OnNoteMeta* list (not consumed).
+ *   paths — folder-path map, or NULL for the bare-title plain form.
+ * ------------------------------------------------------------------------- */
+static void
+print_note_list(GList *notes, GHashTable *paths)
+{
+    json_array_begin();
+    for (GList *l = notes; l != NULL; l = l->next)
+        print_note_line(l->data, paths);
+    json_array_end();
+}
+
+/* ---------------------------------------------------------------------------
+ * cli_paths_for() — the folder-path map a note listing needs: always in
+ * JSON mode (every record carries its path), and in plain mode only when
+ * the caller asked for the path form.  NULL means "bare titles".
+ * Returns a map to destroy with g_hash_table_destroy(), or NULL.
+ * ------------------------------------------------------------------------- */
+static GHashTable *
+cli_paths_for(OnDatabase *db, gboolean want_path)
+{
+    return (cli_json || want_path) ? on_db_folder_path_map(db) : NULL;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_list_notes() — notes in one folder, or one of the library's own
+ * views: --all (every note), --recent (visible notes, newest first — the
+ * "All Notes" row) or --pinned (the "Pinned Notes" section).
+ * ------------------------------------------------------------------------- */
 static int
 cmd_list_notes(OnDatabase *db, const gchar *path)
 {
     GList *notes;                    /* the OnNoteMeta* result set          */
     if (g_strcmp0(path, "--all") == 0) {
         notes = on_db_note_list_all(db, FALSE);
+    } else if (g_strcmp0(path, "--recent") == 0) {
+        notes = on_db_note_list_recent(db);
+    } else if (g_strcmp0(path, "--pinned") == 0) {
+        notes = on_db_note_list_pinned(db);
     } else {
         gint64 folder;               /* resolved folder id                  */
         if (!on_cli_resolve_folder_path(db, path, FALSE, &folder)) {
@@ -368,8 +842,10 @@ cmd_list_notes(OnDatabase *db, const gchar *path)
         }
         notes = on_db_note_list(db, folder);
     }
-    for (GList *l = notes; l != NULL; l = l->next)
-        print_note_line(l->data, NULL);
+    GHashTable *paths = cli_paths_for(db, FALSE);   /* JSON needs the paths */
+    print_note_list(notes, paths);
+    if (paths != NULL)
+        g_hash_table_destroy(paths);
     on_db_note_list_free(notes);
     return 0;
 }
@@ -447,9 +923,19 @@ cmd_cat_note(OnDatabase *db, const gchar *id_str, gboolean markdown)
         text = on_note_text_cached(db, meta->id);
     }
 
-    fputs(text, stdout);
-    if (*text == '\0' || text[strlen(text) - 1] != '\n')
-        putchar('\n');
+    if (cli_json) {
+        /* The whole body as one escaped string: the newlines (and any tabs)
+         * that make raw output ambiguous survive exactly.                  */
+        printf("{\"id\":%" G_GINT64_FORMAT ",\"title\":", meta->id);
+        json_str(meta->title);
+        printf(",\"format\":\"%s\",\"text\":", markdown ? "markdown" : "text");
+        json_str(text);
+        printf("}\n");
+    } else {
+        fputs(text, stdout);
+        if (*text == '\0' || text[strlen(text) - 1] != '\n')
+            putchar('\n');
+    }
 
     g_free(text);
     on_db_note_meta_free(meta);
@@ -475,10 +961,7 @@ cmd_append_note(OnDatabase *db, const gchar *id_str, const gchar *content)
 
     GtkTextBuffer *buffer = on_note_buffer_load(db, meta->id, 0);
     GtkTextIter end;                 /* append position                     */
-    gtk_text_buffer_get_end_iter(buffer, &end);
-    if (gtk_text_buffer_get_char_count(buffer) > 0 &&
-        !gtk_text_iter_starts_line(&end))
-        gtk_text_buffer_insert(buffer, &end, "\n", -1);
+    buffer_append_iter(buffer, &end, "\n");
     gtk_text_buffer_insert(buffer, &end, text, -1);
 
     int rc = 0;                      /* process exit code                   */
@@ -576,10 +1059,7 @@ cmd_add_image(OnDatabase *db, const gchar *id_str, const gchar *file)
     GtkTextBuffer *buffer = on_note_buffer_load(db, id, 0);
 
     GtkTextIter end;                 /* append position                     */
-    gtk_text_buffer_get_end_iter(buffer, &end);
-    if (gtk_text_buffer_get_char_count(buffer) > 0 &&
-        !gtk_text_iter_starts_line(&end))
-        gtk_text_buffer_insert(buffer, &end, "\n", -1);
+    buffer_append_iter(buffer, &end, "\n");
     GtkTextChildAnchor *anchor =
         gtk_text_buffer_create_child_anchor(buffer, &end);
     on_anchor_set_image(anchor, pixbuf, 0);
@@ -596,6 +1076,238 @@ cmd_add_image(OnDatabase *db, const gchar *id_str, const gchar *file)
 }
 
 /* ---------------------------------------------------------------------------
+ * cmd_note_info() — everything about one note that is not its content, as
+ * "key<TAB>value" lines or one JSON object: identity, location, dates,
+ * pinned/trashed state, tag names, and how many images, action items and
+ * characters it holds.  One call instead of the three or four a caller
+ * would otherwise stitch together.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_note_info(OnDatabase *db, const gchar *id_str)
+{
+    OnNoteMeta *meta = note_from_arg(db, id_str);
+    if (meta == NULL)
+        return 2;
+
+    GHashTable *paths = on_db_folder_path_map(db);
+    gchar *path = note_path_of(meta, paths);        /* display path (owned) */
+    g_hash_table_destroy(paths);
+
+    GList *tags = on_db_note_tag_list(db, meta->id);
+    GList *acts = on_db_action_list_for_note(db, meta->id);
+    gint n_open = 0;                 /* not-yet-done action items           */
+    for (GList *l = acts; l != NULL; l = l->next)
+        if (!((OnActionItem *)l->data)->done)
+            n_open++;
+
+    /* Images need the blob, but only its record headers — no PNG is
+     * decoded (on_note_count_images walks past every payload).             */
+    gsize blob_len = 0;              /* stored blob size                    */
+    guint8 *blob = on_db_note_load(db, meta->id, &blob_len);
+    gint n_images = on_note_count_images(blob, blob_len);
+    g_free(blob);
+
+    gchar *body = on_note_text_cached(db, meta->id);
+    glong n_chars = g_utf8_strlen(body, -1);
+    g_free(body);
+
+    gboolean trashed = on_db_note_is_trashed(db, meta->id);
+
+    if (cli_json) {
+        printf("{\"id\":%" G_GINT64_FORMAT ",\"title\":", meta->id);
+        json_str(meta->title);
+        printf(",\"path\":");
+        json_str(path);
+        printf(",\"folder_id\":%" G_GINT64_FORMAT ",", meta->folder_id);
+        json_time("modified", meta->updated_at);
+        putchar(',');
+        json_time("created", meta->created_at);
+        printf(",\"pinned\":%s,\"trashed\":%s,\"tags\":[",
+               meta->pinned ? "true" : "false",
+               trashed ? "true" : "false");
+        for (GList *l = tags; l != NULL; l = l->next) {
+            if (l != tags)
+                putchar(',');
+            json_str(((OnTag *)l->data)->name);
+        }
+        printf("],\"images\":%d,\"actions\":%d,\"actions_open\":%d,"
+               "\"characters\":%ld}\n",
+               n_images, g_list_length(acts), n_open, n_chars);
+    } else {
+        printf("id\t%" G_GINT64_FORMAT "\n", meta->id);
+        printf("title\t%s\n", meta->title);
+        printf("path\t%s\n", path);
+        printf("folder_id\t%" G_GINT64_FORMAT "\n", meta->folder_id);
+        gchar *when = cli_time_str(meta->updated_at, FALSE);
+        printf("modified\t%s\n", when);
+        g_free(when);
+        when = cli_time_str(meta->created_at, FALSE);
+        printf("created\t%s\n", when);
+        g_free(when);
+        printf("pinned\t%s\n", meta->pinned ? "yes" : "no");
+        printf("trashed\t%s\n", trashed ? "yes" : "no");
+        for (GList *l = tags; l != NULL; l = l->next)
+            printf("tag\t%s\n", ((OnTag *)l->data)->name);
+        printf("images\t%d\n", n_images);
+        printf("actions\t%u\t%d open\n", g_list_length(acts), n_open);
+        printf("characters\t%ld\n", n_chars);
+    }
+
+    on_db_action_list_free(acts);
+    on_db_tag_list_free(tags);
+    g_free(path);
+    on_db_note_meta_free(meta);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_note_pin() — set or clear the pinned flag on each given note (the
+ * sidebar's "Pinned Notes" section).
+ * ------------------------------------------------------------------------- */
+static int
+cmd_note_pin(OnDatabase *db, char **ids, int n, gboolean pinned)
+{
+    int rc = 0;                      /* worst exit code seen                */
+    for (int i = 0; i < n; i++) {
+        OnNoteMeta *meta = note_from_arg(db, ids[i]);
+        if (meta == NULL) {
+            rc = 2;
+            continue;
+        }
+        if (on_db_note_set_pinned(db, meta->id, pinned)) {
+            printf("%s note %" G_GINT64_FORMAT "\t%s\n",
+                   pinned ? "pinned" : "unpinned", meta->id, meta->title);
+        } else {
+            fprintf(stderr, "error: could not %s note %" G_GINT64_FORMAT
+                    "\n", pinned ? "pin" : "unpin", meta->id);
+            rc = 2;
+        }
+        on_db_note_meta_free(meta);
+    }
+    return rc;
+}
+
+/* ---------------------------------------------------------------------------
+ * note_image_blob() — load one note's stored blob for the image commands.
+ *   meta     — the note (already validated).
+ *   out_len  — receives the blob length.
+ * Returns the blob (g_free it), or NULL after printing an error.
+ * ------------------------------------------------------------------------- */
+static guint8 *
+note_image_blob(OnDatabase *db, OnNoteMeta *meta, gsize *out_len)
+{
+    guint8 *blob = on_db_note_load(db, meta->id, out_len);
+    if (blob == NULL)
+        fprintf(stderr, "error: note %" G_GINT64_FORMAT " has no content\n",
+                meta->id);
+    return blob;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_note_images() — list a note's embedded images: ordinal, byte size and
+ * pixel dimensions, one per line (or as a JSON array).  Ordinals are
+ * 1-BASED so they match the "![image N]()" placeholders `note cat --md`
+ * writes and the argument `note image` takes.  No image is decoded — the
+ * dimensions come from each PNG's header.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_note_images(OnDatabase *db, const gchar *id_str)
+{
+    OnNoteMeta *meta = note_from_arg(db, id_str);
+    if (meta == NULL)
+        return 2;
+    gsize blob_len = 0;              /* stored blob size                    */
+    guint8 *blob = note_image_blob(db, meta, &blob_len);
+    if (blob == NULL) {
+        on_db_note_meta_free(meta);
+        return 2;
+    }
+
+    gint n = on_note_count_images(blob, blob_len);
+    json_array_begin();
+    for (gint i = 0; i < n; i++) {
+        GBytes *png = on_note_image_nth_png(blob, blob_len, i);
+        if (png == NULL)
+            continue;
+        gsize n_png;                 /* encoded size                        */
+        const guint8 *bytes = g_bytes_get_data(png, &n_png);
+        gint w = 0, h = 0;           /* pixel dimensions from the header    */
+        on_png_probe_size(bytes, n_png, &w, &h);
+        if (cli_json) {
+            json_element();
+            printf("{\"ord\":%d,\"bytes\":%" G_GSIZE_FORMAT
+                   ",\"width\":%d,\"height\":%d}", i + 1, n_png, w, h);
+        } else {
+            printf("%d\t%" G_GSIZE_FORMAT "\t%dx%d\n", i + 1, n_png, w, h);
+        }
+        g_bytes_unref(png);
+    }
+    json_array_end();
+
+    g_free(blob);
+    on_db_note_meta_free(meta);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_note_image() — write one embedded image to a file, byte for byte as
+ * the note stores it: no decode, no re-encode, so what lands on disk is the
+ * original PNG.  `ord` is 1-based (see cmd_note_images).
+ * ------------------------------------------------------------------------- */
+static int
+cmd_note_image(OnDatabase *db, const gchar *id_str, const gchar *ord_str,
+               const gchar *file)
+{
+    OnNoteMeta *meta = note_from_arg(db, id_str);
+    if (meta == NULL)
+        return 2;
+
+    gchar *endp = NULL;              /* end of the parsed ordinal           */
+    gint64 ord = g_ascii_strtoll(ord_str, &endp, 10);
+    if (ord < 1 || endp == NULL || *endp != '\0') {
+        fprintf(stderr, "error: bad image number: %s "
+                        "(1-based, see 'note images')\n", ord_str);
+        on_db_note_meta_free(meta);
+        return 2;
+    }
+
+    gsize blob_len = 0;              /* stored blob size                    */
+    guint8 *blob = note_image_blob(db, meta, &blob_len);
+    if (blob == NULL) {
+        on_db_note_meta_free(meta);
+        return 2;
+    }
+
+    int rc = 0;                      /* process exit code                   */
+    GBytes *png = on_note_image_nth_png(blob, blob_len, (gint)ord - 1);
+    if (png == NULL) {
+        fprintf(stderr, "error: note %" G_GINT64_FORMAT
+                " has no image %s (it has %d)\n",
+                meta->id, ord_str, on_note_count_images(blob, blob_len));
+        rc = 2;
+    } else {
+        gsize n_png;                 /* encoded size                        */
+        const gchar *bytes = g_bytes_get_data(png, &n_png);
+        GError *err = NULL;          /* write failure                       */
+        if (g_file_set_contents(file, bytes, (gssize)n_png, &err)) {
+            printf("wrote image %" G_GINT64_FORMAT " of note %"
+                   G_GINT64_FORMAT " to %s\t%" G_GSIZE_FORMAT " bytes\n",
+                   ord, meta->id, file, n_png);
+        } else {
+            fprintf(stderr, "error: could not write %s: %s\n",
+                    file, err->message);
+            g_clear_error(&err);
+            rc = 2;
+        }
+        g_bytes_unref(png);
+    }
+
+    g_free(blob);
+    on_db_note_meta_free(meta);
+    return rc;
+}
+
+/* ---------------------------------------------------------------------------
  * cmd_note_tags() — print a note's tag names, one per line.
  * ------------------------------------------------------------------------- */
 static int
@@ -605,8 +1317,17 @@ cmd_note_tags(OnDatabase *db, const gchar *id_str)
     if (meta == NULL)
         return 2;
     GList *tags = on_db_note_tag_list(db, meta->id);
-    for (GList *l = tags; l != NULL; l = l->next)
-        printf("%s\n", ((OnTag *)l->data)->name);
+    json_array_begin();
+    for (GList *l = tags; l != NULL; l = l->next) {
+        const gchar *name = ((OnTag *)l->data)->name;
+        if (cli_json) {
+            json_element();
+            json_str(name);
+        } else {
+            printf("%s\n", name);
+        }
+    }
+    json_array_end();
     on_db_tag_list_free(tags);
     on_db_note_meta_free(meta);
     return 0;
@@ -649,10 +1370,7 @@ cmd_tag_note(OnDatabase *db, const gchar *id_str, const gchar *name)
                meta->id, name);
     } else {
         GtkTextIter end;             /* append position                     */
-        gtk_text_buffer_get_end_iter(buffer, &end);
-        if (gtk_text_buffer_get_char_count(buffer) > 0 &&
-            !gtk_text_iter_starts_line(&end))
-            gtk_text_buffer_insert(buffer, &end, " ", -1);
+        buffer_append_iter(buffer, &end, " ");
         gchar *token = g_strdup_printf("#%s", name);
         gtk_text_buffer_insert_with_tags_by_name(buffer, &end, token, -1,
                                                  ON_TAGNAME_TAG, NULL);
@@ -972,11 +1690,21 @@ action_token_parse(OnDatabase *db, const gchar *token,
 static void
 action_print_line(const OnActionItem *it, gboolean with_uid)
 {
-    gchar *when = NULL;              /* ISO due date, or NULL               */
-    if (it->due != 0) {
-        GDateTime *dt = g_date_time_new_from_unix_local(it->due);
-        when = g_date_time_format(dt, "%Y-%m-%d");
-        g_date_time_unref(dt);
+    gchar *when = (it->due != 0)     /* ISO due date, or NULL               */
+                  ? cli_time_str(it->due, TRUE) : NULL;
+    if (cli_json) {
+        /* JSON always carries the uid: there is no reason for a machine
+         * format to hide the one stable way to address an item.            */
+        json_element();
+        printf("{\"uid\":%" G_GINT64_FORMAT ",\"note_id\":%" G_GINT64_FORMAT
+               ",\"ord\":%d,\"done\":%s,\"due\":",
+               it->uid, it->note_id, it->ord, it->done ? "true" : "false");
+        json_str(when);              /* null when the item has no due date  */
+        printf(",\"due_at\":%" G_GINT64_FORMAT ",\"text\":", it->due);
+        json_str(it->text);
+        putchar('}');
+        g_free(when);
+        return;
     }
     if (with_uid)
         printf("%" G_GINT64_FORMAT "\t", it->uid);
@@ -1000,6 +1728,7 @@ static int
 cmd_action_list(OnDatabase *db, ActionFilter filter, gboolean with_uid)
 {
     GList *items = on_db_action_list(db);
+    json_array_begin();
     for (GList *l = items; l != NULL; l = l->next) {
         OnActionItem *it = l->data;  /* one action item                     */
         if ((filter == ACTION_OPEN && it->done) ||
@@ -1007,6 +1736,7 @@ cmd_action_list(OnDatabase *db, ActionFilter filter, gboolean with_uid)
             continue;
         action_print_line(it, with_uid);
     }
+    json_array_end();
     on_db_action_list_free(items);
     return 0;
 }
@@ -1039,6 +1769,8 @@ cmd_action_show(OnDatabase *db, const gchar *token)
         if (it->ord != ord)
             continue;
         action_print_line(it, TRUE);
+        if (cli_json)
+            putchar('\n');           /* a lone object, not an array         */
         rc = 0;
         break;
     }
@@ -1207,34 +1939,158 @@ cmd_export(OnDatabase *db, const gchar *dir, OnExportFormat format)
 }
 
 /* ---------------------------------------------------------------------------
+ * cmd_trash_list() — what the library's Trash section shows: the folders
+ * that were deleted (their subtrees go with them, implicitly) and the
+ * individually deleted notes.
+ *
+ * Plain output labels each row so one listing can carry both kinds:
+ *   "folder<TAB>ID<TAB>NAME"   /   "note<TAB>ID<TAB>MODIFIED<TAB>TITLE"
+ * JSON emits one array of objects, each with a "kind".  Folder ids matter
+ * here: `folder restore` takes an id, because a trashed folder's path no
+ * longer resolves.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_trash_list(OnDatabase *db)
+{
+    GList *folders = on_db_folder_list_trashed(db);
+    GList *notes   = on_db_note_list_trashed(db);
+
+    json_array_begin();
+    for (GList *l = folders; l != NULL; l = l->next) {
+        OnFolder *f = l->data;       /* one deleted folder                  */
+        if (cli_json) {
+            json_element();
+            printf("{\"kind\":\"folder\",\"id\":%" G_GINT64_FORMAT
+                   ",\"name\":", f->id);
+            json_str(f->name);
+            putchar('}');
+        } else {
+            printf("folder\t%" G_GINT64_FORMAT "\t%s\n", f->id, f->name);
+        }
+    }
+    for (GList *l = notes; l != NULL; l = l->next) {
+        OnNoteMeta *m = l->data;     /* one deleted note                    */
+        if (cli_json) {
+            json_element();
+            printf("{\"kind\":\"note\",\"id\":%" G_GINT64_FORMAT
+                   ",\"title\":", m->id);
+            json_str(m->title);
+            printf(",");
+            json_time("modified", m->updated_at);
+            putchar('}');
+        } else {
+            gchar *when = cli_time_str(m->updated_at, FALSE);
+            printf("note\t%" G_GINT64_FORMAT "\t%s\t%s\n",
+                   m->id, when, m->title);
+            g_free(when);
+        }
+    }
+    json_array_end();
+
+    on_db_note_list_free(notes);
+    on_db_folder_list_free(folders);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_trash_empty() — permanently delete everything in the Trash.  This is
+ * the one CLI command with no undo, so it insists on --yes rather than
+ * trusting an argument list that came from a script.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_trash_empty(OnDatabase *db, gboolean confirmed)
+{
+    gint n = on_db_trash_count(db);
+    if (!confirmed) {
+        fprintf(stderr, "error: 'trash empty' permanently deletes %d item%s "
+                        "and cannot be undone; pass --yes to confirm\n",
+                n, n == 1 ? "" : "s");
+        return 2;
+    }
+    if (n == 0) {
+        printf("trash is already empty\n");
+        return 0;
+    }
+    if (!on_db_trash_empty(db)) {
+        fprintf(stderr, "error: could not empty the trash\n");
+        return 2;
+    }
+    printf("emptied trash\t%d item%s\n", n, n == 1 ? "" : "s");
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cmd_stats() — database-wide counts in one call: notes (total and
+ * visible), folders, tags, pinned notes, trash size and action items.
+ * "key<TAB>value" lines, or one JSON object.
+ * ------------------------------------------------------------------------- */
+static int
+cmd_stats(OnDatabase *db)
+{
+    gint notes = 0, folders = 0, tags = 0;      /* whole-table totals       */
+    on_db_totals(db, &notes, &folders, &tags);
+    gint visible = on_db_note_count_visible(db);
+    gint pinned  = on_db_note_count_pinned(db);
+    gint trash   = on_db_trash_count(db);
+    gint acts = 0, acts_open = 0;               /* action-item counts       */
+    on_db_action_counts(db, &acts, &acts_open);
+
+    if (cli_json) {
+        printf("{\"notes\":%d,\"notes_visible\":%d,\"folders\":%d,"
+               "\"tags\":%d,\"pinned\":%d,\"trash\":%d,"
+               "\"actions\":%d,\"actions_open\":%d,\"database\":",
+               notes, visible, folders, tags, pinned, trash,
+               acts, acts_open);
+        json_str(db->path);
+        printf("}\n");
+    } else {
+        printf("notes\t%d\n", notes);
+        printf("notes-visible\t%d\n", visible);
+        printf("folders\t%d\n", folders);
+        printf("tags\t%d\n", tags);
+        printf("pinned\t%d\n", pinned);
+        printf("trash\t%d\n", trash);
+        printf("actions\t%d\t%d open\n", acts, acts_open);
+        printf("database\t%s\n", db->path != NULL ? db->path : "");
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
  * cmd_search() — case-insensitive search of every visible note's title +
  * plain text (the search window's strategy: the body_text cache fetched
  * as ONE map query, extraction fallback per unfilled row).  Prints one
  * "ID<TAB>MODIFIED<TAB>/Folder/Sub/Title" line per hit; no GTK needed.
- *   use_regex — TRUE to treat `query` as a GRegex pattern (still
- *               case-insensitive) instead of a literal substring.
+ *   query     — the query, in the same language the search window takes:
+ *               words ANDed, "quoted phrases", -exclusions (search_query.h).
+ *               Quote the whole thing for the shell, which eats the quotes
+ *               and would read a leading '-' as an option.
+ *   use_regex — TRUE to treat `query` as one GRegex pattern (still
+ *               case-insensitive) instead, with no term syntax.
  * ------------------------------------------------------------------------- */
 static int
 cmd_search(OnDatabase *db, const gchar *query, gboolean use_regex)
 {
-    GRegex *regex = NULL;            /* compiled pattern (regex mode)       */
-    gchar  *query_ci = NULL;         /* casefolded needle (plain mode)      */
-    if (use_regex) {
-        GError *err = NULL;
-        regex = g_regex_new(query, G_REGEX_CASELESS, 0, &err);
-        if (regex == NULL) {
-            fprintf(stderr, "error: bad pattern: %s\n", err->message);
-            g_clear_error(&err);
-            return 2;
-        }
-    } else {
-        query_ci = g_utf8_casefold(query, -1);
+    GError  *err = NULL;             /* regex compile failure               */
+    OnQuery *q = on_query_new(query, FALSE, use_regex, &err);
+    if (q == NULL) {
+        fprintf(stderr, "error: bad pattern: %s\n", err->message);
+        g_clear_error(&err);
+        return 2;
+    }
+    if (on_query_is_empty(q)) {
+        fprintf(stderr, "error: empty search query\n");
+        on_query_free(q);
+        return 2;
     }
 
     GList      *notes  = on_db_note_list_all(db, FALSE);
     GHashTable *bodies = on_db_note_text_map(db, 0);    /* id → body text      */
     GHashTable *paths  = on_db_folder_path_map(db);  /* folder id → path    */
 
+    /* Hits print as they are found, so the array is framed around the walk
+     * rather than collected first.                                         */
+    json_array_begin();
     for (GList *l = notes; l != NULL; l = l->next) {
         OnNoteMeta *m = l->data;     /* candidate note                      */
         const gchar *body = g_hash_table_lookup(bodies, &m->id);
@@ -1244,23 +2100,17 @@ cmd_search(OnDatabase *db, const gchar *query, gboolean use_regex)
             body = fallback;
         }
 
-        /* Same matcher the search window's worker uses (query casefolded
-         * once above, not per note as this used to do).                     */
-        gboolean match = on_note_text_matches(m->title, body, query,
-                                              query_ci, regex);
-        if (match) {
-            const gchar *fpath = g_hash_table_lookup(paths, &m->folder_id);
-            print_note_line(m, fpath != NULL ? fpath : "");
-        }
+        /* Same matcher the search window's worker uses.                    */
+        if (on_query_matches(q, m->title, body))
+            print_note_line(m, paths);
         g_free(fallback);
     }
+    json_array_end();
 
     g_hash_table_destroy(paths);
     g_hash_table_destroy(bodies);
     on_db_note_list_free(notes);
-    if (regex != NULL)
-        g_regex_unref(regex);
-    g_free(query_ci);
+    on_query_free(q);
     return 0;
 }
 
@@ -1276,11 +2126,23 @@ usage(FILE *out)
 "  tag delete NAME                   remove a tag from the database\n"
 "\n"
 "  folder list                       print the folder tree with note counts\n"
+"  folder info PATH                  id, path, emoji, AI mode and contents\n"
 "  folder add PATH                   create a folder path (like mkdir -p)\n"
+"  folder rename PATH NAME           rename a folder in place\n"
+"  folder move PATH DEST|/           re-nest a folder (with its subtree)\n"
+"  folder emoji PATH EMOJI|-         set the sidebar emoji ('-' clears it)\n"
+"  folder ai-mode PATH MODE          normal | project | custom\n"
+"  folder sort PATH|/                order its subfolders alphabetically\n"
+"  folder restore ID                 take a folder out of the Trash (by ID,\n"
+"                                    from 'trash list': a trashed folder's\n"
+"                                    path no longer resolves)\n"
 "  folder delete [--permanent] PATH  move a folder AND everything inside to\n"
 "                                    the Trash (--permanent: delete outright)\n"
 "\n"
-"  note list [PATH|--all]            print ID/modified/title per note\n"
+"  note list [PATH|--all|--recent|--pinned]\n"
+"                                    print ID/modified/title per note\n"
+"  note info ID                      title, path, dates, pinned/trashed,\n"
+"                                    tags, image and action-item counts\n"
 "  note cat ID [--md]                print a note's plain text (--md:\n"
 "                                    Markdown keeping the formatting;\n"
 "                                    images become placeholders)\n"
@@ -1299,6 +2161,13 @@ usage(FILE *out)
 "  note tag ID NAME                  add a #tag to a note (the literal\n"
 "                                    '#NAME' token is appended to the text)\n"
 "  note untag ID NAME                remove a #tag from a note's text\n"
+"  note pin ID...                    pin notes (sidebar's Pinned Notes)\n"
+"  note unpin ID...                  unpin them again\n"
+"  note images ID                    list a note's images: N, bytes, WxH\n"
+"                                    (N is 1-based, matching the\n"
+"                                    '![image N]()' of 'note cat --md')\n"
+"  note image ID N FILE              write image N out, byte for byte as\n"
+"                                    stored (no decode, no re-encode)\n"
 "  note add-image ID FILE            append an image file to a note\n"
 "  note set-modified ID TIMESTAMP    set a note's modified date (UNIX\n"
 "                                    seconds; for importers)\n"
@@ -1329,7 +2198,18 @@ usage(FILE *out)
 "\n"
 "  search TEXT [--regex]             case-insensitive search of all note\n"
 "                                    titles + text; prints one\n"
-"                                    ID/modified/path line per hit\n"
+"                                    ID/modified/path line per hit.\n"
+"                                    TEXT is ANDed words, \"quoted\n"
+"                                    phrases\" and -excluded words (quote\n"
+"                                    the whole query for the shell);\n"
+"                                    --regex takes it as one pattern\n"
+"\n"
+"  trash list                        what the Trash holds: deleted folders\n"
+"                                    (kind/id/name) and notes\n"
+"  trash empty --yes                 PERMANENTLY delete all of it\n"
+"\n"
+"  stats                             database-wide counts (notes, folders,\n"
+"                                    tags, pinned, trash, action items)\n"
 "\n"
 "  quicknote                         create a note in the root folder and\n"
 "                                    open its editor in the running instance\n"
@@ -1338,7 +2218,16 @@ usage(FILE *out)
 "  backup FILE.db                    snapshot the database to FILE.db\n"
 "  export-md DIR                     export all notes as Markdown into DIR\n"
 "  export-html DIR                   export all notes as HTML into DIR\n"
-"  help                              show this text\n",
+"  help                              show this text\n"
+"\n"
+"  --json                            on the commands that print records\n"
+"                                    (note list/info/cat/tags/images,\n"
+"                                    folder list/info, tag list/notes,\n"
+"                                    action list/show, search, trash list,\n"
+"                                    stats): emit JSON instead of tab-\n"
+"                                    separated lines, so a title or item\n"
+"                                    text containing a tab or newline\n"
+"                                    cannot shift the columns\n",
         out);
     return out == stderr ? 1 : 0;
 }
@@ -1366,6 +2255,20 @@ dispatch_folder(OnDatabase *db, const char *verb, char **argv, int argc)
         return cmd_list_folders(db);
     if (g_strcmp0(verb, "add") == 0 && argc == 1)
         return cmd_add_folder(db, argv[0]);
+    if (g_strcmp0(verb, "info") == 0 && argc == 1)
+        return cmd_folder_info(db, argv[0]);
+    if (g_strcmp0(verb, "rename") == 0 && argc == 2)
+        return cmd_folder_rename(db, argv[0], argv[1]);
+    if (g_strcmp0(verb, "move") == 0 && argc == 2)
+        return cmd_folder_move(db, argv[0], argv[1]);
+    if (g_strcmp0(verb, "emoji") == 0 && argc == 2)
+        return cmd_folder_emoji(db, argv[0], argv[1]);
+    if (g_strcmp0(verb, "ai-mode") == 0 && argc == 2)
+        return cmd_folder_ai_mode(db, argv[0], argv[1]);
+    if (g_strcmp0(verb, "sort") == 0 && argc == 1)
+        return cmd_folder_sort(db, argv[0]);
+    if (g_strcmp0(verb, "restore") == 0 && argc == 1)
+        return cmd_folder_restore(db, argv[0]);
     if (g_strcmp0(verb, "delete") == 0) {
         /* folder delete [--permanent] PATH  (flag accepted either side)    */
         if (argc == 1 && g_strcmp0(argv[0], "--permanent") != 0)
@@ -1409,6 +2312,20 @@ dispatch_action(OnDatabase *db, const char *verb, char **argv, int argc)
         return cmd_action_due(db, argv[0], argv[1]);
     if (g_strcmp0(verb, "text") == 0 && argc == 2)
         return cmd_action_text(db, argv[0], argv[1]);
+    return usage(stderr);
+}
+
+static int
+dispatch_trash(OnDatabase *db, const char *verb, char **argv, int argc)
+{
+    if (g_strcmp0(verb, "list") == 0 && argc == 0)
+        return cmd_trash_list(db);
+    if (g_strcmp0(verb, "empty") == 0) {
+        if (argc == 0)
+            return cmd_trash_empty(db, FALSE);
+        if (argc == 1 && g_strcmp0(argv[0], "--yes") == 0)
+            return cmd_trash_empty(db, TRUE);
+    }
     return usage(stderr);
 }
 
@@ -1462,6 +2379,16 @@ dispatch_note(OnDatabase *db, const char *verb, char **argv, int argc)
         return cmd_tag_note(db, argv[0], argv[1]);
     if (g_strcmp0(verb, "untag") == 0 && argc == 2)
         return cmd_untag_note(db, argv[0], argv[1]);
+    if (g_strcmp0(verb, "info") == 0 && argc == 1)
+        return cmd_note_info(db, argv[0]);
+    if (g_strcmp0(verb, "pin") == 0 && argc >= 1)
+        return cmd_note_pin(db, argv, argc, TRUE);
+    if (g_strcmp0(verb, "unpin") == 0 && argc >= 1)
+        return cmd_note_pin(db, argv, argc, FALSE);
+    if (g_strcmp0(verb, "images") == 0 && argc == 1)
+        return cmd_note_images(db, argv[0]);
+    if (g_strcmp0(verb, "image") == 0 && argc == 3)
+        return cmd_note_image(db, argv[0], argv[1], argv[2]);
     if (g_strcmp0(verb, "add-image") == 0 && argc == 2)
         return cmd_add_image(db, argv[0], argv[1]);
     if (g_strcmp0(verb, "set-modified") == 0 && argc == 2)
@@ -1526,7 +2453,16 @@ on_cli_command_mutates(int argc, char **argv)
     if (g_strcmp0(cmd, "tag") == 0)
         return g_strcmp0(verb, "delete") == 0;
     if (g_strcmp0(cmd, "folder") == 0)
-        return g_strcmp0(verb, "add") == 0 || g_strcmp0(verb, "delete") == 0;
+        return g_strcmp0(verb, "add") == 0 ||
+               g_strcmp0(verb, "delete") == 0 ||
+               g_strcmp0(verb, "rename") == 0 ||
+               g_strcmp0(verb, "move") == 0 ||
+               g_strcmp0(verb, "emoji") == 0 ||
+               g_strcmp0(verb, "ai-mode") == 0 ||
+               g_strcmp0(verb, "sort") == 0 ||
+               g_strcmp0(verb, "restore") == 0;
+    if (g_strcmp0(cmd, "trash") == 0)
+        return g_strcmp0(verb, "empty") == 0;
     if (g_strcmp0(cmd, "action") == 0)
         return g_strcmp0(verb, "done") == 0 ||
                g_strcmp0(verb, "undone") == 0 ||
@@ -1542,7 +2478,9 @@ on_cli_command_mutates(int argc, char **argv)
                g_strcmp0(verb, "tag") == 0 ||
                g_strcmp0(verb, "untag") == 0 ||
                g_strcmp0(verb, "add-image") == 0 ||
-               g_strcmp0(verb, "set-modified") == 0;
+               g_strcmp0(verb, "set-modified") == 0 ||
+               g_strcmp0(verb, "pin") == 0 ||
+               g_strcmp0(verb, "unpin") == 0;
     return FALSE;         /* search / backup / export-* are read-only       */
 }
 
@@ -1558,11 +2496,84 @@ cli_is_noun(const char *cmd)
     return g_strcmp0(cmd, "tag")    == 0 ||
            g_strcmp0(cmd, "folder") == 0 ||
            g_strcmp0(cmd, "note")   == 0 ||
-           g_strcmp0(cmd, "action") == 0;
+           g_strcmp0(cmd, "action") == 0 ||
+           g_strcmp0(cmd, "trash")  == 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * cli_json_capable() — does this command take --json?  Only the commands
+ * that PRINT records do; everywhere else "--json" is ordinary text (a note
+ * whose content is the literal "--json" must survive `note new`), so the
+ * flag is recognised here and nowhere else.
+ * ------------------------------------------------------------------------- */
+static gboolean
+cli_json_capable(const char *cmd, const char *verb)
+{
+    if (g_strcmp0(cmd, "note") == 0)
+        return g_strcmp0(verb, "list") == 0 ||
+               g_strcmp0(verb, "info") == 0 ||
+               g_strcmp0(verb, "cat") == 0 ||
+               g_strcmp0(verb, "tags") == 0 ||
+               g_strcmp0(verb, "images") == 0;
+    if (g_strcmp0(cmd, "folder") == 0)
+        return g_strcmp0(verb, "list") == 0 || g_strcmp0(verb, "info") == 0;
+    if (g_strcmp0(cmd, "tag") == 0)
+        return g_strcmp0(verb, "list") == 0 || g_strcmp0(verb, "notes") == 0;
+    if (g_strcmp0(cmd, "action") == 0)
+        return g_strcmp0(verb, "list") == 0 || g_strcmp0(verb, "show") == 0;
+    if (g_strcmp0(cmd, "trash") == 0)
+        return g_strcmp0(verb, "list") == 0;
+    return g_strcmp0(cmd, "search") == 0 || g_strcmp0(cmd, "stats") == 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cli_json_take() — set the output mode for this invocation and remove the
+ * flag from the argument vector, so every verb below still validates its own
+ * argument count without knowing the flag exists.
+ *   argv — the invocation, copied by the caller (this shuffles it).
+ *   argc — its length, lowered by one when the flag was taken.
+ * ------------------------------------------------------------------------- */
+static void
+cli_json_take(char **argv, int *argc)
+{
+    /* Assign, never OR: inside a GUI instance serving remote CLI calls the
+     * flag outlives the command that set it.                               */
+    cli_json = FALSE;
+    if (!cli_json_capable(argv[1], (*argc >= 3) ? argv[2] : ""))
+        return;
+    for (int i = 2; i < *argc; i++) {
+        if (g_strcmp0(argv[i], "--json") != 0)
+            continue;
+        cli_json = TRUE;
+        for (int j = i; j + 1 < *argc; j++)
+            argv[j] = argv[j + 1];
+        (*argc)--;
+        return;
+    }
+}
+
+/* Forward declaration: the router below, called with the flags stripped.   */
+static int cli_dispatch_verbs(OnDatabase *db, int argc, char **argv);
 
 int
 on_cli_dispatch_db(OnDatabase *db, int argc, char **argv)
+{
+    /* --json is stripped from a COPY, leaving the caller's argv alone (the
+     * IPC server hands us the vector it also logs).                        */
+    char **args = g_memdup2(argv, (gsize)argc * sizeof *argv);
+    cli_json_take(args, &argc);
+    int rc = cli_dispatch_verbs(db, argc, args);
+    g_free(args);
+    return rc;
+}
+
+/* ---------------------------------------------------------------------------
+ * cli_dispatch_verbs() — route one (already flag-stripped) invocation to
+ * its command.  Split from on_cli_dispatch_db so every exit path frees the
+ * argument copy.
+ * ------------------------------------------------------------------------- */
+static int
+cli_dispatch_verbs(OnDatabase *db, int argc, char **argv)
 {
     const char *cmd = argv[1];       /* the noun/flat command               */
 
@@ -1578,6 +2589,10 @@ on_cli_dispatch_db(OnDatabase *db, int argc, char **argv)
         return dispatch_note(db, argv[2], argv + 3, argc - 3);
     if (g_strcmp0(cmd, "action") == 0)
         return dispatch_action(db, argv[2], argv + 3, argc - 3);
+    if (g_strcmp0(cmd, "trash") == 0)
+        return dispatch_trash(db, argv[2], argv + 3, argc - 3);
+    if (g_strcmp0(cmd, "stats") == 0)
+        return (argc == 2) ? cmd_stats(db) : usage(stderr);
     if (g_strcmp0(cmd, "search") == 0) {
         if (argc == 3)
             return cmd_search(db, argv[2], FALSE);
@@ -1628,6 +2643,7 @@ on_cli_run(int argc, char **argv)
     /* Anything that is not a known noun/command falls through to GTK
      * (which has its own option handling for things like --display).       */
     gboolean is_flat = g_strcmp0(cmd, "search") == 0 ||
+                       g_strcmp0(cmd, "stats") == 0 ||
                        g_strcmp0(cmd, "backup") == 0 ||
                        g_strcmp0(cmd, "export-md") == 0 ||
                        g_strcmp0(cmd, "export-html") == 0;

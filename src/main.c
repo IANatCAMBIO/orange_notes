@@ -375,15 +375,10 @@ main(int argc, char *argv[])
                                                       g_free, NULL),
         .library_window       = NULL,
         .notify_notes_changed = NULL,
-        .toolbar_style        = { GTK_TOOLBAR_ICONS, GTK_TOOLBAR_ICONS },
-        .toolbars             = { NULL, NULL },
         .icons_dir            = NULL,
         .db_dir               = NULL,
     };
     app.db_dir = db_dir;             /* ownership transferred               */
-    for (gint k = 0; k < ON_TOOLBAR_N_KINDS; k++)
-        app.toolbars[k] = g_ptr_array_new();
-    on_app_load_toolbar_styles(&app);
     on_app_init_icons_dir(&app, argv[0]);
 
     /* Boolean preferences (second argument = default when unset).          */
@@ -439,8 +434,6 @@ main(int argc, char *argv[])
      * returns, so the database can be closed and hashed safely now.        */
     g_object_unref(app.gtk_app);
     g_hash_table_destroy(app.editors);
-    for (gint k = 0; k < ON_TOOLBAR_N_KINDS; k++)
-        g_ptr_array_free(app.toolbars[k], TRUE);
 
     on_db_close(app.db);
 

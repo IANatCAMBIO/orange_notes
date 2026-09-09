@@ -12,9 +12,19 @@
  *   notes tag notes NAME             (notes labeled with a tag)
  *   notes tag delete NAME
  *   notes folder list
+ *   notes folder info PATH           (id, path, emoji, AI mode, contents)
  *   notes folder add PATH            (nested, created like mkdir -p)
+ *   notes folder rename PATH NAME
+ *   notes folder move PATH DEST|/    (re-nests the whole subtree)
+ *   notes folder emoji PATH EMOJI|-  (the sidebar prefix; - clears it)
+ *   notes folder ai-mode PATH normal|project|custom
+ *   notes folder sort PATH|/         (its subfolders, alphabetically)
+ *   notes folder restore ID          (out of the Trash, BY ID: a trashed
+ *                                        folder's path no longer resolves)
  *   notes folder delete [--permanent] PATH    (default: to the Trash)
- *   notes note list [PATH|--all]
+ *   notes note list [PATH|--all|--recent|--pinned]
+ *   notes note info ID               (dates, tags, pinned/trashed, and
+ *                                        image/action counts, in one call)
  *   notes note cat ID [--md]         (plain text, or Markdown render)
  *   notes note new [--folder PATH] CONTENT|-   (- reads stdin)
  *   notes note append ID CONTENT|-   (plain text, on a fresh line)
@@ -25,6 +35,10 @@
  *   notes note tags ID
  *   notes note tag ID NAME           (appends the literal #NAME token)
  *   notes note untag ID NAME
+ *   notes note pin|unpin ID [ID...]
+ *   notes note images ID             (N, bytes, WxH — N is 1-based, the
+ *                                        numbering 'note cat --md' uses)
+ *   notes note image ID N FILE       (writes the stored PNG out verbatim)
  *   notes note open PATH             (id or Folder/Title; uses the GUI)
  *   notes action list [--open|--done] [--uid]  ('!' items; NOTEID:ORD
  *                                        positions, --uid prepends the
@@ -38,11 +52,26 @@
  *   notes action text UID|NOTEID:ORD TEXT|- (renames the item in the note
  *                                        line, keeping its done state, its
  *                                        due date and its UID)
- *   notes search TEXT [--regex]      (titles + full text, all notes)
+ *   notes search TEXT [--regex]      (titles + full text, all notes;
+ *                                        TEXT is ANDed words, "quoted
+ *                                        phrases" and -exclusions, or
+ *                                        one pattern with --regex)
+ *   notes trash list                 (deleted folders and notes)
+ *   notes trash empty --yes          (PERMANENT; refuses without --yes)
+ *   notes stats                      (whole-database counts)
  *   notes quicknote                  (new root note in the running GUI)
  *   notes backup FILE.db
  *   notes export-md DIR
  *   notes export-html DIR
+ *
+ * Every command that PRINTS RECORDS also takes --json (note
+ * list/info/cat/tags/images, folder list/info, tag list/notes, action
+ * list/show, search, trash list, stats), emitting one JSON array — or one
+ * object for the single-record commands — instead of tab-separated lines.
+ * A title, folder name or action text may itself contain a tab, which
+ * silently shifts the plain form's columns; JSON escapes it instead.  The
+ * flag is recognised ONLY on those commands, so content that happens to be
+ * the literal "--json" still reaches `note new`.
  * =========================================================================== */
 
 #ifndef BLUE_CLI_H

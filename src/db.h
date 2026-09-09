@@ -223,6 +223,14 @@ gboolean on_db_folder_move(OnDatabase *db, gint64 id, gint64 parent_id);
 gboolean on_db_folder_reorder(OnDatabase *db, const gint64 *folder_ids,
                               gsize n);
 
+/* Order one folder's DIRECT children alphabetically (case-insensitive) and
+ * persist that as their sort_order — THE "Sort Subfolders Alphabetically"
+ * operation, shared by the folder context menu and the CLI.  One level
+ * only: each child's own children keep the order they had.
+ *   parent_id — whose children to sort (0 = the top level).
+ * Returns how many children were sorted, or -1 on failure.                  */
+gint on_db_folder_sort_children(OnDatabase *db, gint64 parent_id);
+
 /* PERMANENTLY delete folder `id`; all descendant folders and contained
  * notes are removed by ON DELETE CASCADE and orphaned tags are pruned.
  * The GUI trashes folders instead (on_db_folder_trash); this is the
@@ -472,6 +480,11 @@ GList *on_db_folder_list_trashed(OnDatabase *db);
 /* List the directly-trashed notes (what selecting Trash shows), newest
  * first. Returns a GList of OnNoteMeta*; free with on_db_note_list_free(). */
 GList *on_db_note_list_trashed(OnDatabase *db);
+
+/* TRUE when note `id` is in the Trash — either flagged itself or sitting
+ * inside a trashed folder's subtree (the same rule every visible listing
+ * filters on).  A missing note reads as not trashed.                        */
+gboolean on_db_note_is_trashed(OnDatabase *db, gint64 id);
 
 /* Number of items directly in the Trash: trashed notes + trashed folders. */
 gint on_db_trash_count(OnDatabase *db);

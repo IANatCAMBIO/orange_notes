@@ -1,9 +1,11 @@
 /* ===========================================================================
  * search_window.c — the note search window (implementation)
  *
- * Each search matches title-or-body against the query using one of three
- * strategies: plain case-insensitive (casefolded strstr), plain
- * case-sensitive (strstr), or GRegex (with or without G_REGEX_CASELESS).
+ * The query itself is parsed by search_query.[ch] — quoted phrases,
+ * '-' exclusions and implicit AND between terms, or one GRegex pattern
+ * when the Regular expression box is ticked — and the resulting OnQuery
+ * does all the matching, exactly as it does for the headless `search`
+ * command.
  *
  * Note bodies come from the notes.body_text cache column so a search
  * never decodes images or builds text buffers.  Rows saved before the
@@ -23,6 +25,7 @@
  * =========================================================================== */
 
 #include "search_window.h"
+#include "search_query.h"
 #include "serialize.h"
 #include "editor_window.h"
 #include "library_window.h"
@@ -57,6 +60,10 @@ typedef struct SearchJob SearchJob;  /* forward: one in-flight search       */
  *                   spinning while a worker thread is searching.
  *   job           — the in-flight search, or NULL when idle (the job is
  *                   owned by its worker/idle chain, never freed here).
+ *   highlight     — the last search's highlight term (owned), carried into
+ *                   the editor when a result is opened.  Taken from the
+ *                   parsed query, not the entry text, so opening a hit for
+ *                   `cats -dogs` seeds the in-note search with "cats".
  *   win_w/win_h   — the window's current size, tracked by configure
  *                   events and persisted on close so the next search
  *                   window opens at the size this one was left at.
@@ -73,6 +80,7 @@ typedef struct {
     GtkWidget     *status;
     GtkWidget     *spinner;
     SearchJob     *job;
+    gchar         *highlight;
     gint           win_w;
     gint           win_h;
 } OnSearch;
@@ -121,10 +129,8 @@ search_hit_free(gpointer data)
  *   cancelled      — set (atomically, from the main thread) when the
  *                    window closes or a newer search supersedes this one.
  *   db_path        — database file to open privately (owned).
- *   query          — the search text (owned).
- *   case_sensitive — plain-match case option.
- *   regex          — compiled pattern, or NULL for plain matching (GRegex
- *                    is immutable, so cross-thread use is safe).
+ *   query          — the parsed query (owned); immutable, so the worker
+ *                    thread may match with it freely.
  *   scoped/
  *   scope_tag/
  *   scope_id       — candidate-note scope resolved before the thread ran.
@@ -136,9 +142,7 @@ struct SearchJob {
     OnSearch  *sw;
     gint       cancelled;
     gchar     *db_path;
-    gchar     *query;
-    gboolean   case_sensitive;
-    GRegex    *regex;
+    OnQuery   *query;
     gboolean   scoped;
     gboolean   scope_tag;
     gint64     scope_id;
@@ -151,11 +155,9 @@ struct SearchJob {
 static void
 search_job_free(SearchJob *job)
 {
-    if (job->regex != NULL)
-        g_regex_unref(job->regex);
     g_ptr_array_free(job->hits, TRUE);
     g_free(job->db_path);
-    g_free(job->query);
+    on_query_free(job->query);
     g_free(job->scope_desc);
     g_free(job->error);
     g_free(job);
@@ -266,9 +268,6 @@ search_worker(gpointer user_data)
     guint n_candidates = g_list_length(notes);
     GHashTable *bodies = (n_candidates > SEARCH_BULK_TEXT_MIN)
                          ? on_db_note_text_map(db, 0) : NULL;
-    /* The query is casefolded once here, not twice per note.               */
-    gchar *query_ci = job->case_sensitive
-                      ? NULL : g_utf8_casefold(job->query, -1);
 
     for (GList *l = notes; l != NULL; l = l->next) {
         if (g_atomic_int_get(&job->cancelled))
@@ -283,8 +282,7 @@ search_worker(gpointer user_data)
         }
 
         gboolean match =             /* does this note match the query?     */
-            on_note_text_matches(m->title, body, job->query, query_ci,
-                                 job->regex);
+            on_query_matches(job->query, m->title, body);
         g_free(extracted);
         if (!match)
             continue;
@@ -297,7 +295,6 @@ search_worker(gpointer user_data)
         g_date_time_unref(dt);
         g_ptr_array_add(job->hits, h);
     }
-    g_free(query_ci);
     if (bodies != NULL)
         g_hash_table_destroy(bodies);
     g_hash_table_destroy(paths);
@@ -336,28 +333,33 @@ run_search(OnSearch *sw)
     gboolean scoped = gtk_toggle_button_get_active(
         GTK_TOGGLE_BUTTON(sw->radio_scoped));
 
-    /* Compile the regex up front so a bad pattern errors immediately.      */
-    GRegex *regex = NULL;            /* compiled pattern (regex mode only)  */
-    if (use_regex) {
-        GError *err = NULL;
-        regex = g_regex_new(query,
-                            case_sensitive ? 0 : G_REGEX_CASELESS,
-                            0, &err);
-        if (regex == NULL) {
-            gchar *msg = g_strdup_printf("Bad pattern: %s", err->message);
-            gtk_label_set_text(GTK_LABEL(sw->status), msg);
-            g_free(msg);
-            g_clear_error(&err);
-            return;
-        }
+    /* Parse (and, in regex mode, compile) up front so a bad pattern errors
+     * immediately, on the main thread.                                     */
+    GError  *err = NULL;             /* regex compile failure               */
+    OnQuery *parsed = on_query_new(query, case_sensitive, use_regex, &err);
+    if (parsed == NULL) {
+        gchar *msg = g_strdup_printf("Bad pattern: %s", err->message);
+        gtk_label_set_text(GTK_LABEL(sw->status), msg);
+        g_free(msg);
+        g_clear_error(&err);
+        return;
     }
+    /* Punctuation only ("" or a lone quote): nothing to match with.        */
+    if (on_query_is_empty(parsed)) {
+        gtk_label_set_text(GTK_LABEL(sw->status), "Type something to search for.");
+        on_query_free(parsed);
+        return;
+    }
+
+    /* What an opened result highlights in the note — the query's first
+     * positive term, never the raw entry text with its operators.          */
+    g_free(sw->highlight);
+    sw->highlight = g_strdup(on_query_highlight_term(parsed));
 
     SearchJob *job = g_new0(SearchJob, 1);
     job->sw             = sw;
     job->db_path        = g_strdup(sw->app->db->path);
-    job->query          = g_strdup(query);
-    job->case_sensitive = case_sensitive;
-    job->regex          = regex;     /* ownership passes to the job         */
+    job->query          = parsed;    /* ownership passes to the job         */
     job->scoped         = scoped;
     job->hits           = g_ptr_array_new_with_free_func(search_hit_free);
 
@@ -393,10 +395,10 @@ on_result_activated(GtkTreeView *view, GtkTreePath *path,
         return;
     gint64 id;                       /* note id of the row                  */
     gtk_tree_model_get(GTK_TREE_MODEL(sw->store), &iter, SR_ID, &id, -1);
-    /* Carry the current query into the editor so the same term is
-     * highlighted in the note (plain text; a regex query is seeded as-is).  */
-    const gchar *term = gtk_entry_get_text(GTK_ENTRY(sw->entry));
-    on_editor_window_open_search(sw->app, id, term);
+    /* Carry the searched-for term into the editor so it is highlighted in
+     * the note: the query's first positive term (a regex query is seeded
+     * as-is), which is NULL when the query only excluded things.           */
+    on_editor_window_open_search(sw->app, id, sw->highlight);
 }
 
 /* on_search_configure() — track the window's live size so it can be
@@ -429,6 +431,7 @@ on_search_destroy(GtkWidget *widget, gpointer user_data)
         g_free(w);
         g_free(h);
     }
+    g_free(sw->highlight);
     g_free(sw);
 }
 
@@ -474,6 +477,11 @@ search_window_build(OnApp *app, gboolean scope_to_sel)
     sw->entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(sw->entry),
                                    "Search titles and note text\xe2\x80\xa6");
+    gtk_widget_set_tooltip_text(sw->entry,
+        "Every word must appear somewhere in the note.\n"
+        "\"in quotes\" matches the whole phrase; -word excludes notes "
+        "that contain it.\n"
+        "Regular expression mode takes the query as one pattern instead.");
     /* Both triggers run the search; swapped-connect passes `sw` as the
      * handler's (only used) argument, so no wrapper callbacks needed.      */
     g_signal_connect_swapped(sw->entry, "activate",
@@ -511,6 +519,9 @@ search_window_build(OnApp *app, gboolean scope_to_sel)
     GtkWidget *opt_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
     sw->check_case  = gtk_check_button_new_with_label("Case sensitive");
     sw->check_regex = gtk_check_button_new_with_label("Regular expression");
+    gtk_widget_set_tooltip_text(sw->check_regex,
+        "Match the whole query as one pattern; quoting and -exclusions "
+        "keep their regular-expression meaning instead");
     gtk_box_pack_start(GTK_BOX(opt_row), sw->check_case,  FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(opt_row), sw->check_regex, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), opt_row, FALSE, FALSE, 0);

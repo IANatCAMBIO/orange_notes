@@ -1,7 +1,7 @@
 /* ===========================================================================
  * app.c — shared application helpers (implementation)
  *
- * Icon loading and the app-wide toolbar-style machinery.  Icons live in a
+ * Icon loading and the shared toolbar-button factory.  Icons live in a
  * plain folder of SVG/PNG files next to the executable ("icons/"), named
  * by the usual freedesktop action names (edit-delete.svg, list-add.svg,
  * …) so users can swap any of them by replacing the file.
@@ -14,13 +14,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-
-/* Settings-table keys under which the toolbar styles are persisted,
- * indexed by OnToolbarKind.                                                 */
-static const gchar *STYLE_SETTING_KEYS[ON_TOOLBAR_N_KINDS] = {
-    "toolbar_style_library",
-    "toolbar_style_editor",
-};
 
 void
 on_app_status(OnApp *app, const gchar *fmt, ...)
@@ -210,118 +203,7 @@ on_app_tool_item_new(OnApp *app, gboolean toggle, const gchar *icon_name,
     gtk_tool_button_set_icon_widget(GTK_TOOL_BUTTON(item), icon);
 
     gtk_tool_item_set_tooltip_text(item, tooltip);
-    /* Show the label even in BOTH_HORIZ-style themes.                      */
-    gtk_tool_item_set_is_important(item, TRUE);
     return item;
-}
-
-/* on_toolbar_destroyed() — drop a dying toolbar from its registry.  The
- * registry it lives in is stashed on the toolbar as "on-registry".          */
-static void
-on_toolbar_destroyed(GtkWidget *toolbar, gpointer user_data)
-{
-    (void)user_data;
-    GPtrArray *registry =            /* the kind-specific registry          */
-        g_object_get_data(G_OBJECT(toolbar), "on-registry");
-    if (registry != NULL)
-        g_ptr_array_remove(registry, toolbar);
-}
-
-/* on_style_menu_toggled() — a radio item in a toolbar's right-click menu
- * became active: apply that style to the item's toolbar family.             */
-static void
-on_style_menu_toggled(GtkCheckMenuItem *item, gpointer user_data)
-{
-    OnApp *app = user_data;          /* the application context             */
-    if (!gtk_check_menu_item_get_active(item))
-        return;                      /* ignore the deactivating item        */
-    on_app_set_toolbar_style(
-        app,
-        (OnToolbarKind)GPOINTER_TO_INT(
-            g_object_get_data(G_OBJECT(item), "on-kind")),
-        (GtkToolbarStyle)GPOINTER_TO_INT(
-            g_object_get_data(G_OBJECT(item), "on-style")));
-}
-
-/* ---------------------------------------------------------------------------
- * on_toolbar_context_menu() — "popup-context-menu" handler: right-clicking
- * a toolbar offers the text/icons/both radio choices for its family.
- * ------------------------------------------------------------------------- */
-static gboolean
-on_toolbar_context_menu(GtkToolbar *toolbar, gint x, gint y, gint button,
-                        gpointer user_data)
-{
-    (void)x; (void)y; (void)button;
-    OnApp *app = user_data;          /* the application context             */
-    OnToolbarKind kind = (OnToolbarKind)GPOINTER_TO_INT(
-        g_object_get_data(G_OBJECT(toolbar), "on-kind"));
-
-    GtkWidget *menu = gtk_menu_new();
-    gtk_menu_attach_to_widget(GTK_MENU(menu), GTK_WIDGET(toolbar), NULL);
-    g_signal_connect(menu, "selection-done",
-                     G_CALLBACK(gtk_widget_destroy), NULL);
-
-    static const struct { const gchar *label; GtkToolbarStyle style; }
-    STYLES[] = {
-        { "_Text only",        GTK_TOOLBAR_TEXT  },
-        { "_Icons only",       GTK_TOOLBAR_ICONS },
-        { "Icons _above Text", GTK_TOOLBAR_BOTH  },
-    };
-    GSList *group = NULL;            /* the radio group being built         */
-    for (gsize i = 0; i < G_N_ELEMENTS(STYLES); i++) {
-        GtkWidget *item =
-            gtk_radio_menu_item_new_with_mnemonic(group, STYLES[i].label);
-        group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(item));
-        g_object_set_data(G_OBJECT(item), "on-kind",
-                          GINT_TO_POINTER(kind));
-        g_object_set_data(G_OBJECT(item), "on-style",
-                          GINT_TO_POINTER(STYLES[i].style));
-        /* Mark the current style BEFORE connecting so setup is silent.     */
-        if (app->toolbar_style[kind] == STYLES[i].style)
-            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item),
-                                           TRUE);
-        g_signal_connect(item, "toggled",
-                         G_CALLBACK(on_style_menu_toggled), app);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
-    }
-    gtk_widget_show_all(menu);
-    gtk_menu_popup_at_pointer(GTK_MENU(menu), NULL);
-    return TRUE;
-}
-
-void
-on_app_register_toolbar(OnApp *app, OnToolbarKind kind, GtkWidget *toolbar)
-{
-    gtk_toolbar_set_style(GTK_TOOLBAR(toolbar), app->toolbar_style[kind]);
-    g_ptr_array_add(app->toolbars[kind], toolbar);
-    g_object_set_data(G_OBJECT(toolbar), "on-registry",
-                      app->toolbars[kind]);
-    g_object_set_data(G_OBJECT(toolbar), "on-kind", GINT_TO_POINTER(kind));
-    g_signal_connect(toolbar, "destroy",
-                     G_CALLBACK(on_toolbar_destroyed), app);
-    /* Right-clicking any toolbar offers its style choices directly.        */
-    g_signal_connect(toolbar, "popup-context-menu",
-                     G_CALLBACK(on_toolbar_context_menu), app);
-}
-
-void
-on_app_set_toolbar_style(OnApp *app, OnToolbarKind kind,
-                         GtkToolbarStyle style)
-{
-    app->toolbar_style[kind] = style;
-
-    /* Restyle every live toolbar of this kind.                             */
-    GPtrArray *registry = app->toolbars[kind];
-    for (guint i = 0; i < registry->len; i++)
-        gtk_toolbar_set_style(
-            GTK_TOOLBAR(g_ptr_array_index(registry, i)), style);
-
-    /* Persist the choice.                                                  */
-    const gchar *value =             /* settings-table representation       */
-        (style == GTK_TOOLBAR_TEXT)  ? "text"
-      : (style == GTK_TOOLBAR_ICONS) ? "icons"
-                                     : "both";
-    on_app_config_set(STYLE_SETTING_KEYS[kind], value);
 }
 
 /* ---------------------------------------------------------------------------
@@ -732,19 +614,3 @@ on_app_switch_database(OnApp *app, const gchar *new_dir)
     return ok;
 }
 
-void
-on_app_load_toolbar_styles(OnApp *app)
-{
-    for (gint kind = 0; kind < ON_TOOLBAR_N_KINDS; kind++) {
-        gchar *value = on_app_config_get(STYLE_SETTING_KEYS[kind]);
-        GtkToolbarStyle style = GTK_TOOLBAR_ICONS;   /* the default         */
-        if (value != NULL) {
-            if (g_strcmp0(value, "text") == 0)
-                style = GTK_TOOLBAR_TEXT;
-            else if (g_strcmp0(value, "both") == 0)
-                style = GTK_TOOLBAR_BOTH;
-            g_free(value);
-        }
-        app->toolbar_style[kind] = style;
-    }
-}

@@ -15,6 +15,11 @@
  * Matching is against note titles and their full plain text.  The scope
  * radio limits the search to the folder or tag currently selected in the
  * library.  Case-sensitive and regular-expression matching are optional.
+ *
+ * The query language is search_query.[ch]'s, shared with the headless
+ * `notes search`: words are ANDed, "quoted phrases" match whole, and a
+ * -word excludes.  Ticking Regular expression turns all of that off and
+ * takes the query as one pattern.
  * =========================================================================== */
 
 #ifndef BLUE_SEARCH_WINDOW_H
@@ -49,7 +54,8 @@ void on_search_window_open(OnApp *app, gboolean scope_to_sel);
  * with a query and run that search immediately.  Used by the library
  * toolbar's search entry: scope is All Notes, matching is plain and
  * case-insensitive (the window's own defaults), so the results are on
- * screen without the user pressing Search a second time.
+ * screen without the user pressing Search a second time.  The query goes
+ * through the same operators as one typed into the window itself.
  *
  *   app   — global application context.
  *   query — text to search for; NULL/empty just opens an idle window.
